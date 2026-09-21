@@ -16,9 +16,31 @@ htmlcov/
 # scratch campaigns made by `csp init` while testing
 my-campaign/
 
+# retired code, kept locally so the history is recoverable (backup/README.md)
+backup/
+
 # superseded cover drafts; docs/assets/cspflow-cover-v3.png is the one in use
 docs/assets/cspflow-cover.png
 docs/assets/cspflow-cover-v2.png
 
 # the results symlink a campaign makes on its first run
 examples/*/results
+
+# The slide deck at the repository root, which is built rather than authored.
+# ANCHORED: an unanchored `report/` also matches src/cspflow/report/, which is
+# the package's own report module. Three of its files were tracked from before
+# this rule existed, so `git status` looked clean while every file added to it
+# afterwards was silently dropped from every commit.
+/report/
+
+# Campaign folders are personal working data. Only the small, documented ones
+# that the guide sends new users to are shared: campaigns/tests/ and
+# campaigns/smoke-runs/. Their generated output stays out.
+/campaigns/*
+!/campaigns/tests/
+!/campaigns/smoke-runs/
+/campaigns/**/results
+/campaigns/**/report/
+/campaigns/**/*.log
+/Agentic_test/
+*.log

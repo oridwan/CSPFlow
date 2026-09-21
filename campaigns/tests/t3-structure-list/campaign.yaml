@@ -1,0 +1,142 @@
+# t3-structure-list -- SMOKE TEST for source mode `structure_list`.
+#
+# WHAT THIS MODE DOES
+#     You supply the structures. There is NO generate stage at all -- the seeds
+#     go straight to screening. This is the mode the real CePdGe and CeFeB
+#     campaigns use, and the only one of the three that needs no GPU for
+#     generation and no MatterGen checkpoint.
+#
+# WHY THIS IS THE ONE TO RUN FIRST
+#     It is the shortest path from `csp run` to a finished VASP job: no
+#     generation, three known seeds, a reference hull that is already complete.
+#     If something is wrong with the machine profile, the POTCARs, the store or
+#     the new one-job-per-structure submission, this is where it shows up
+#     fastest.
+#
+# THE SEEDS
+#     inputs/seeds/ holds the DFT-relaxed CONTCARs of three real Ce-Fe phases,
+#     copied from the reference store. They are on or near the hull by
+#     construction, so this test has a KNOWN EXPECTED ANSWER: all three should
+#     survive the filter and come back with e_above_hull near zero. A smoke test
+#     you cannot grade is only half a test.
+#
+# RUNTIME: minutes to the queue, then one VASP job per seed (~30-60 min each at
+#     6-10 atoms, 16 ranks, under the `smoke` recipe).
+name: t3-structure-list
+machine: orion
+workdir: /scratch/$USER/cspflow/t3-structure-list
+archive: null
+
+source:
+  - mode: structure_list
+    name: seeds
+    structure_list:
+      paths:
+        - inputs/seeds         # relative to THIS folder
+      relax: true              # MLIP-relax each seed before screening
+      dedup: warn              # warn, not drop: three seeds, say something
+      max_atoms: 16            # refuse anything bigger at read time
+
+screen:
+  mlip: mattersim
+  mattersim:
+    model: MatterSim-v1.0.0-5M.pth
+    fmax: 0.05
+    max_steps: 100
+  dedup:
+    matcher: {ltol: 0.2, stol: 0.2, angle_tol: 5.0}
+  resources: {role: gpu, gpus: 1, time: "01:00:00"}
+
+# ---------------------------------------------------------------- reference --
+# Ce-Fe is chosen because the shared store ALREADY HOLDS ALL FIVE of its phases
+# at our own DFT settings (CeFe2, CeFe5, Ce4Fe, Ce2Fe17 x2, all `ready=True`).
+# So the reference stage finds a complete hull and computes nothing: the stage
+# that would otherwise dominate a test run costs seconds.
+#
+# Check before changing the chemistry:
+#   python -c "import csv;rows=list(csv.DictReader(open('/projects/mmi/cspflow-shared/store/index.csv')));print([ (r['formula'],r['ready']) for r in rows if r['chemsys']=='Ce-Fe'])"
+reference:
+  functionals: [GGA]
+  thermo_type: GGA_GGA+U
+  energy_scale: raw
+  mode: recompute            # our own energies, from the shared store
+  prescreen_mode: mp_energies
+  prescreen_hull_max: 0.50   # wide: a smoke test must not lose everything here
+  snapshot: true
+  relax_with_mlip: true
+
+# ------------------------------------------------------------------- filter --
+filter:
+  e_above_hull_max: 0.50     # deliberately loose. The point is to REACH DFT,
+                             # not to select well; a tight cut on a handful of
+                             # structures is how a smoke test ends with zero
+                             # candidates and tells you nothing.
+  e_above_hull_max_source: literal   # NOT 'calibrated': calibration was
+                             # retired from the funnel (D126), so there is no
+                             # fitted alpha/beta to rescale the threshold by.
+  max_per_composition: 3
+  spacegroup: {min_number: 1}
+
+# ---------------------------------------------------------------------- dft --
+dft:
+  recipe: recipe.yaml        # the campaign-local `smoke` recipe. Resolves
+                             # against THIS folder, not the shell's cwd (D132).
+  layout: runs               # one directory per structure...
+  combined_job: true         # ...and one job per structure, relax+static in it
+  potcar:
+    tree: VASP6.4
+    functional: PBE_64
+    overrides: {}
+  # THIS BLOCK IS COPIED VERBATIM FROM THE STORE'S store-settings.yaml, and
+  # that is the whole point. `recipe_id` hashes the campaign's dft block; if it
+  # differs from the store's, candidate and reference energies land on
+  # different scales, the hull still builds, looks correct, and ranks wrongly
+  # (D101). `csp doctor` says so -- and it says so about the PRODUCTION CePdGe
+  # campaign too, which uses `ferri`/`ferrimagnetic_retm` against the store's
+  # `ferro`/`ferromagnetic`.
+  #
+  # A test campaign is the one place that mismatch is not acceptable, because
+  # a test whose numbers cannot be graded is not a test. Matching the store is
+  # what makes "the seeds should come back near e_above_hull = 0" a real
+  # expectation instead of a hope.
+  rare_earth:
+    f_treatment: frozen      # Ce 4f in the core. NOTE: m_dft_raw is then ~0 for
+                             # Ce BY CONSTRUCTION -- correct behaviour here, not
+                             # a failed test (see the 4f trap).
+    magnetic_order: ferro
+    reconstruct_ms: true
+  magnetism:
+    # `mode` is materialised into `table` below, because recipe_id hashes the
+    # NUMBERS, not the mode name. Copying the mode without the table gives a
+    # different fingerprint and a mixed-scale hull.
+    mode: ferromagnetic
+    strict: true             # KEPT strict: a silent default moment is the bug
+                             # this flag exists to catch
+    table:                   # merges into FERRO_RETM; adds only these elements
+      As: 0.6
+      Sb: 0.6
+      Bi: 0.6
+      Au: 0.6
+      Ru: 3.0                # 4d7 Hund maximum -- the one non-trivial value
+      In: 0.6
+      Se: 0.6
+      Te: 0.6
+  ldau: {enabled: false, ldau_type: 2, u: {}, j: {}}
+  nbands: auto
+  incar_overrides: {}
+  max_in_flight: 8           # small on purpose: a test should be visible in
+  max_concurrent_tasks: 8    # `squeue` at a glance, not fill it
+  max_cores: 128             # the cap that binds: 8 jobs x 16 ranks. Counts
+                             # this campaign's QUEUED and RUNNING jobs, nobody
+                             # else's, recomputed every cycle.
+  select:
+    rank_by: e_above_hull_mlip
+    max_per_composition: 2
+    max_total: 6             # LIFETIME ceiling for the campaign, not per cycle
+                             # (no budget_core_hours: retired, D143 -- cap cores
+                             # with dft.max_cores above, not projected spend)
+
+# ------------------------------------------------------------------ analyze --
+analyze:
+  properties: [m_dft_raw, m_s_reconstructed, volume, spacegroup]
+  report: html

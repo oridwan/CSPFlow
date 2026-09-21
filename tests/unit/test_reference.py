@@ -220,3 +220,142 @@ class TestPlacement:
     def test_render_marks_the_stable_ones(self):
         text = build_hull(fe_sm_reference()).render()
         assert "raw scale" in text and text.count("*") >= 4
+
+
+# -- deliberate exclusions (D120) ------------------------------------------
+
+class TestExclusions:
+    """"We decided this phase cannot matter" vs "nobody has run it yet".
+
+    Without a way to say the first, `coverage` reads both as missing and one
+    abandoned elemental polymorph blocks every hull in its chemistry forever.
+    On this project that was 33 phases holding up 262 of 432 systems.
+    """
+
+    @staticmethod
+    def _cache(tmp_path, monkeypatch, phases, computed=()):
+        """An MP download plus whatever we hold our own energies for."""
+        import json
+
+        from cspflow.reference.computed import ComputedPhase, write_record
+        from cspflow.reference.mp import THERMO_GGA, ReferenceEntry, snapshot_id
+
+        cache = tmp_path / "cache"
+        cache.mkdir(exist_ok=True)
+        monkeypatch.setenv("CSPFLOW_REFERENCE", str(cache))
+        rows = [{
+            "mp_id": mp_id, "formula": formula, "chemsys": "Fe",
+            "counts": counts, "n_atoms": sum(counts.values()),
+            "thermo_type": THERMO_GGA, "e_raw_per_atom": 0.0,
+            "e_corrected_per_atom": 0.0, "e_above_hull_mp": 0.0,
+            "run_type": THERMO_GGA,
+        } for mp_id, formula, counts in phases]
+        (cache / f"Fe__{THERMO_GGA.replace('+', 'p')}.json").write_text(json.dumps({
+            "chemsys": "Fe", "thermo_type": THERMO_GGA,
+            "snapshot_id": snapshot_id([ReferenceEntry(**r) for r in rows]),
+            "fetched_at": "2026-09-09T00:00:00", "warnings": [], "entries": rows,
+        }))
+        for mp_id, counts, energy in computed:
+            write_record(ComputedPhase(
+                mp_id=mp_id, formula="Fe1", chemsys="Fe", counts=dict(counts),
+                n_atoms=sum(counts.values()), recipe_id="r" * 64,
+                e_dft=energy, dft_converged=True, state="done"))
+        return cache
+
+    def test_an_excluded_phase_leaves_the_wanted_set(self, tmp_path, monkeypatch):
+        from cspflow.reference.computed import coverage, write_excluded
+
+        self._cache(tmp_path, monkeypatch,
+                    [("mp-1", "Fe1", {"Fe": 1}), ("mp-2", "Fe1", {"Fe": 2})],
+                    computed=[("mp-1", {"Fe": 1}, -8.0)])
+        assert not coverage("Fe", "r" * 64).complete      # mp-2 is missing
+
+        write_excluded("r" * 64, {"mp-2": {"why": "a sibling sits far below"}})
+        cov = coverage("Fe", "r" * 64)
+        assert cov.complete
+        assert cov.excluded == ["mp-2"]
+        assert "mp-2" not in cov.wanted and "mp-2" not in cov.missing
+
+    def test_an_exclusion_is_reported_not_silently_forgotten(self, tmp_path, monkeypatch):
+        """A system must read "complete, 1 excluded", never just complete: an
+        exclusion is a judgement about the hull and stays visible."""
+        from cspflow.reference.computed import coverage, write_excluded
+
+        self._cache(tmp_path, monkeypatch,
+                    [("mp-1", "Fe1", {"Fe": 1}), ("mp-2", "Fe1", {"Fe": 2})],
+                    computed=[("mp-1", {"Fe": 1}, -8.0)])
+        write_excluded("r" * 64, {"mp-2": {"why": "a sibling sits far below"}})
+        assert "1 excluded" in coverage("Fe", "r" * 64).render()
+
+    def test_an_excluded_phase_is_not_a_hull_vertex(self, tmp_path, monkeypatch):
+        from cspflow.reference.computed import entries_for, write_excluded
+
+        self._cache(tmp_path, monkeypatch,
+                    [("mp-1", "Fe1", {"Fe": 1}), ("mp-2", "Fe1", {"Fe": 2})],
+                    computed=[("mp-1", {"Fe": 1}, -8.0)])
+        write_excluded("r" * 64, {"mp-2": {"why": "a sibling sits far below"}})
+        assert [e.label for e in entries_for("Fe", "r" * 64)] == ["mp-1"]
+
+    def test_a_missing_exclusion_file_excludes_nothing(self, tmp_path, monkeypatch):
+        """The safe direction: it makes `coverage` refuse, never accept."""
+        from cspflow.reference.computed import load_excluded
+
+        self._cache(tmp_path, monkeypatch, [("mp-1", "Fe1", {"Fe": 1})])
+        assert load_excluded("r" * 64) == {}
+
+    def test_the_richer_json_shape_is_read(self, tmp_path, monkeypatch):
+        """The tree's own EXCLUDED.json stores a dict per phase, not a string."""
+        from cspflow.reference.computed import load_excluded, write_excluded
+
+        self._cache(tmp_path, monkeypatch, [("mp-1", "Fe1", {"Fe": 1})])
+        write_excluded("r" * 64, {"mp-1": {"decision": "dropped", "why": "vacuum box"}})
+        assert load_excluded("r" * 64)["mp-1"] == "vacuum box"
+
+    def test_writing_keeps_reasons_already_recorded(self, tmp_path, monkeypatch):
+        from cspflow.reference.computed import load_excluded, write_excluded
+
+        self._cache(tmp_path, monkeypatch, [("mp-1", "Fe1", {"Fe": 1})])
+        write_excluded("r" * 64, {"mp-1": {"why": "first"}})
+        write_excluded("r" * 64, {"mp-9": {"why": "second"}})
+        assert set(load_excluded("r" * 64)) == {"mp-1", "mp-9"}
+
+    def test_a_phase_with_a_converged_sibling_is_proposed(self, tmp_path, monkeypatch):
+        from cspflow.reference.computed import propose_exclusions
+
+        self._cache(tmp_path, monkeypatch,
+                    [("mp-1", "Fe1", {"Fe": 1}), ("mp-2", "Fe1", {"Fe": 2})],
+                    computed=[("mp-1", {"Fe": 1}, -8.0)])
+        proposal = propose_exclusions(["Fe"], "r" * 64)
+        assert set(proposal.droppable) == {"mp-2"}
+        assert not proposal.keep
+        entry = proposal.droppable["mp-2"]
+        assert entry["best_sibling"] == "mp-1"
+        assert entry["n_converged_siblings"] == 1
+
+    def test_the_sole_entry_at_a_composition_is_refused(self, tmp_path, monkeypatch):
+        """The one case no energy argument can rescue. Dropping it deletes a
+        vertex the hull needs, and the boundary is then set by whichever
+        compound happens to be lowest -- with no visible symptom."""
+        from cspflow.reference.computed import propose_exclusions
+
+        self._cache(tmp_path, monkeypatch,
+                    [("mp-1", "Fe1", {"Fe": 1}), ("mp-2", "Ni1", {"Ni": 1})],
+                    computed=[("mp-1", {"Fe": 1}, -8.0)])
+        proposal = propose_exclusions(["Fe"], "r" * 64)
+        assert not proposal.droppable
+        assert "mp-2" in proposal.keep
+        assert "nothing else" in proposal.keep["mp-2"]
+        assert "MUST COMPUTE mp-2" in proposal.render()
+
+    def test_a_reduced_composition_counts_as_the_same_composition(self, tmp_path,
+                                                                  monkeypatch):
+        """Fe1 and Fe2 are one composition with two cell sizes. Grouping on the
+        raw counts would call every supercell a sole entry and refuse it."""
+        from cspflow.reference.computed import propose_exclusions
+
+        self._cache(tmp_path, monkeypatch,
+                    [("mp-1", "Fe1", {"Fe": 1}), ("mp-2", "Fe1", {"Fe": 4})],
+                    computed=[("mp-1", {"Fe": 1}, -8.0)])
+        proposal = propose_exclusions(["Fe"], "r" * 64)
+        assert set(proposal.droppable) == {"mp-2"}
+        assert proposal.droppable["mp-2"]["reduced"] == "Fe1"

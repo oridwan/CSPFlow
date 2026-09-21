@@ -183,11 +183,18 @@ class TestPlumbing:
         stage.run(store)
         assert stage.pending(store) == 0
 
-    def test_it_sits_after_calibrate_in_the_funnel(self):
+    def test_it_sits_after_reference_in_the_funnel(self):
+        """`calibrate` used to sit between the two.  It is gone (D126): the hull
+        that filters now takes its vertices from the store's own MatterSim
+        energies, so both sides of it are one scale and there is nothing left to
+        calibrate."""
         from cspflow.driver import STAGE_ORDER
+        from cspflow.stages import IMPLEMENTED
 
-        assert STAGE_ORDER.index("calibrate") < STAGE_ORDER.index("filter")
+        assert STAGE_ORDER.index("reference") < STAGE_ORDER.index("filter")
         assert STAGE_ORDER.index("filter") < STAGE_ORDER.index("dft")
+        assert "calibrate" not in STAGE_ORDER
+        assert "calibrate" not in IMPLEMENTED
 
 
 # -- the spacegroup floor --------------------------------------------------

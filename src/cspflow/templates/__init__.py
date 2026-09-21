@@ -1,211 +1,256 @@
-"""Campaign scaffolds.
+"""Campaign scaffolds: `csp init <type> <name>` copies one of the three examples.
 
-`csp init` writes a campaign *folder*, not a lone file, because the knobs a
-user actually reaches for live in three different places -- what to search
-(campaign.yaml), where it runs (machine.yaml) and how the DFT is done
-(recipe.yaml) -- and two of those used to be buried inside the installed
-package where nobody could find, read or edit them.
+A campaign is one of three types, one per source mode, and each has a complete
+worked example in `examples/`:
 
-The annotated campaign file is the single source of truth here: the terse
-`--minimal` variant is *derived* from it by dropping the comment lines, so the
-two can never drift apart. Every tunable key is present as a comment showing
-the default already in effect; uncommenting one changes it. Tier-3 knobs (raw
-INCAR tags, retry ladders) live in recipe.yaml, which is now a file in the
-campaign folder rather than a name resolved inside site-packages.
+    1  chemical_space     examples/1-chemical-space/
+    2  composition_list   examples/2-composition-list/
+    3  structure_list     examples/3-structure-list/
+
+Those example files ARE the templates. `csp init` reads the example's
+campaign.yaml and changes four lines -- `name`, `machine`, `dft.recipe` and
+`reference.mode` -- and nothing else, so an example and the campaign it scaffolds
+cannot drift apart. There used to be a separate all-modes template string here,
+and it had already diverged from the examples (dead `calibrate:` blocks in one,
+not the other).
+
+The machine profile and DFT recipe are NOT copied from the example folder; they
+are copied from the shipped files, so `-m local` still means the local profile.
+The examples' own machine.yaml / recipe.yaml are pinned by a test to be exactly
+what `machine_copy` / `recipe_copy` produce.
+
+Inputs:  kind (1|2|3 or an alias), name, machine/recipe names, reference mode.
+Outputs: campaign.yaml text, README text, and the example's demo input files.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
-# Placeholders are @TOKENS@ rather than {braces} so the template can contain
-# YAML flow mappings -- {elements: [...]} -- without doubling every brace.
-CAMPAIGN = """\
-# ===========================================================================
-#  @NAME@ -- cspflow campaign
-#
-#  Everything this campaign needs is in this folder:
-#
-#    campaign.yaml   what to search, and how hard        <- you are here
-#    machine.yaml    scheduler, partitions, codes, POTCAR trees
-#    recipe.yaml     the DFT ladder: INCAR tags, k-points, resources
-#    inputs/         your own structures or composition lists
-#    results/        symlink to workdir, made on the first run
-#
-#  Uncommented keys are live. Commented keys show the default already in
-#  effect -- delete the leading "# " to change one; the indentation is already
-#  right. To see the resolved value of every key and which file supplied it:
-#
-#      csp config show --origins
-# ===========================================================================
+# templates/__init__.py -> templates -> cspflow -> src -> repository root.
+EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples"
 
-name: @NAME@
-machine: @MACHINE@
-workdir: /scratch/$USER/cspflow/@NAME@
-archive: /projects/mmi/Ridwan/cspflow_archive/@NAME@
 
-# ---------------------------------------------------------------------------
-# 1. SOURCE -- what to search
-#
-#    Three modes, and a campaign may hold several entries at once. The two
-#    below the live one are complete and ready to uncomment.
-# ---------------------------------------------------------------------------
-source:
-  - mode: chemical_space
-    name: sweep
-    chemical_space:
-      groups:
-        # `pick` has no default on purpose: one element per group gives binary
-        # systems, allowing two adds ternaries and a 5-10x larger sweep.
-        A: {elements: [Sm, Tb],                pick: 1}
-        B: {elements: [Fe, Co, Ni],            pick: 1, min_fraction: 0.75}
-        C: {elements: [Ti, V, Cr, Mn, Cu, Zn], pick: 1}
-      max_atoms_formula: 20
-      max_rare_earth: 1           # rare-earth species per system; null = no limit
-    defaults:
-      z: {min: 1, max: 2}
-      max_atoms: 40
-      n_structures: {mode: per_atom, structures_per_atom: 2.0}
+@dataclass(frozen=True)
+class CampaignType:
+    number: int
+    mode: str
+    folder: str
+    question: str               # what the user is saying when they pick it
+    what_you_give: str
+    aliases: tuple[str, ...]
+    edit_first: tuple[str, ...]  # the lines to change before anything else
 
-#   - mode: composition_list      # exactly these formulas, no sweep
-#     name: shortlist
-#     composition_list:
-#       items:
-#         - {formula: Sm2Fe17,  z: [1, 1], max_atoms: 38}
-#         - {formula: SmFe11Ti, z: [1, 2], max_atoms: 26,
-#            n_structures: {mode: fixed, count: 40}}
-#       # from_file: inputs/compositions.csv  # or a CSV: formula[,z_min,z_max,n_structures]
+    @property
+    def label(self) -> str:
+        return f"type {self.number}: {self.mode}"
 
-#   - mode: structure_list        # skip generation; enter the funnel at screen
-#     name: seeds
-#     structure_list:
-#       paths: [inputs/seeds]     # POSCAR/CIF paths or globs
-#       relax: true               # MLIP-relax them before screening
-#       dedup: warn               # warn | drop -- 'warn' keeps curated near-duplicates
-#       max_atoms: 40
 
-# ---------------------------------------------------------------------------
-# 2. GENERATE -- candidate structures per composition
-#     (delete this whole block for a structure_list-only campaign)
-# ---------------------------------------------------------------------------
-generate:
-  engine: mattergen
-  mattergen:
-    model: /projects/mmi/shuo/MatterGen_checkpoints/18-55-08
-#     mode: csp                   # csp | unconditional
-#     max_batch_size: 100
-#     timeout_per_batch: 1800     # seconds
-#   resources: {role: gpu, gpus: 1, time: "24:00:00"}
+CAMPAIGN_TYPES: dict[int, CampaignType] = {
+    1: CampaignType(
+        number=1, mode="chemical_space", folder="1-chemical-space",
+        question="search a region of the periodic table",
+        what_you_give="element groups; cspflow enumerates the formulas and generates structures",
+        aliases=("chemical_space", "chemical-space", "space", "sweep"),
+        edit_first=(
+            "campaign.yaml  source.chemical_space.groups   the elements, and how many to pick from each",
+            "campaign.yaml  max_atoms_formula, defaults     the sweep's size -- check it with --dry-run",
+        ),
+    ),
+    2: CampaignType(
+        number=2, mode="composition_list", folder="2-composition-list",
+        question="I know which formulas I want",
+        what_you_give="formulas, inline or in a CSV; cspflow generates structures for exactly those",
+        aliases=("composition_list", "composition-list", "compositions", "formulas"),
+        edit_first=(
+            "inputs/compositions.csv                        DEMO list -- replace it with your formulas",
+            "campaign.yaml  source.composition_list.items   the inline exceptions (or delete them)",
+        ),
+    ),
+    3: CampaignType(
+        number=3, mode="structure_list", folder="3-structure-list",
+        question="I already have the structures",
+        what_you_give="POSCAR/CIF files; nothing is generated, they enter the funnel at screen",
+        aliases=("structure_list", "structure-list", "structures", "seeds"),
+        edit_first=(
+            "inputs/seeds/                                  DEMO seeds -- replace them with your files",
+            "campaign.yaml  structure_list.max_atoms        must clear your largest seed",
+        ),
+    ),
+}
 
-# ---------------------------------------------------------------------------
-# 3. SCREEN + DEDUP -- MLIP relaxation, then throw away the duplicates
-# ---------------------------------------------------------------------------
-# screen:
-#   mlip: mattersim               # mattersim | mace | uma
-#   mattersim:
-#     model: MatterSim-v1.0.0-5M.pth
-#     fmax: 0.01                  # eV/A force convergence
-#     max_steps: 500
-#     batch_size: 32
-#   dedup:
-#     matcher: {ltol: 0.2, stol: 0.2, angle_tol: 5.0}
-#   resources: {role: gpu, gpus: 1, time: "24:00:00"}
 
-# ---------------------------------------------------------------------------
-# 4. REFERENCE -- the convex hull the candidates are measured against
-# ---------------------------------------------------------------------------
-# reference:
-#   functionals: [GGA]
-#   thermo_type: GGA_GGA+U        # PINNED. MP mixes functionals silently; a
-#                                 # reference set with more than one is refused.
-#   energy_scale: raw             # raw | mp_corrected
-#   mode: recompute               # mp_energies | recompute
-#   prescreen_mode: mp_energies
-#   prescreen_hull_max: 0.20      # widened for Phase A
-#   snapshot: true                # freeze the MP query so the hull cannot move
-#   snapshot_id: auto
-#   relax_with_mlip: true
-#   cache: $CSPFLOW_CACHE/mp
+def parse_type(text: str | None) -> CampaignType | None:
+    """`1`, `chemical_space`, `seeds` ... -> the type, or None if unrecognised."""
+    if text is None:
+        return None
+    key = text.strip().lower()
+    for ctype in CAMPAIGN_TYPES.values():
+        if key == str(ctype.number) or key in ctype.aliases:
+            return ctype
+    return None
 
-# ---------------------------------------------------------------------------
-# 5. CALIBRATE -- prove the cheap number predicts the expensive one
-# ---------------------------------------------------------------------------
-# calibrate:
-#   mp:                           # free: MP's own DFT, at FIXED geometry
-#     on_fail: warn
-#     thresholds: {mae_e_per_atom: 0.05, spearman_min: 0.9, max_volume_drift: 0.05}
-#   pilot:                        # costs pilot DFT: OUR DFT. the real gate.
-#     on_fail: block
-#     pilot_n: 40
-#     thresholds: {mae_e_per_atom: 0.05, mae_e_hull: 0.05, spearman_min: 0.9}
 
-# ---------------------------------------------------------------------------
-# 6. FILTER -- who is worth a VASP job
-# ---------------------------------------------------------------------------
-filter:
-  e_above_hull_max: 0.10          # eV/atom
-#   e_above_hull_max_source: calibrated   # literal | calibrated
-#   max_per_composition: 5
-#   spacegroup: {min_number: 1}   # 3 and up excludes P1 and P-1
+def type_menu() -> str:
+    """The three types, as `csp init` prints them when it has to ask."""
+    lines = ["Campaign types:", ""]
+    for t in CAMPAIGN_TYPES.values():
+        lines.append(f"  {t.number}  {t.mode:<18} \"{t.question}\"")
+        lines.append(f"     {'':<18} you give {t.what_you_give}")
+    lines += ["", "  csp init 1 my-sweep     csp init 2 my-shortlist     csp init 3 my-seeds"]
+    return "\n".join(lines)
 
-# ---------------------------------------------------------------------------
-# 7. DFT -- the expensive half. Tags and k-points live in recipe.yaml.
-# ---------------------------------------------------------------------------
-dft:
-  recipe: @RECIPE@
-#   potcar:
-#     tree: VASP6.4               # VASP6.4 | VASP5.2 -- both supported
-#     functional: PBE_64
-#     overrides: {}               # element -> POTCAR symbol
-#   rare_earth:
-#     f_treatment: frozen         # frozen | valence -- one convention per campaign
-#     magnetic_order: ferri
-#     reconstruct_ms: true
-#   magnetism:
-#     mode: ferrimagnetic_retm
-#     strict: true                # fail if any site would take a default MAGMOM
-#   ldau: {enabled: false, ldau_type: 2, u: {}, j: {}}
-#   nbands: auto
-#   incar_overrides: {}           # free-form; applied on top of the recipe
-#   max_in_flight: 200            # jobs queued at once
-#   max_concurrent_tasks: 48
-#   select:
-#     rank_by: e_above_hull_mlip
-#     max_per_composition: 3
-#     max_total: 1500
-#     budget_core_hours: 200000   # Phase B stops here
 
-# ---------------------------------------------------------------------------
-# 8. ANALYZE -- what comes out
-# ---------------------------------------------------------------------------
-# analyze:
-#   properties: [m_dft_raw, m_s_reconstructed, volume, spacegroup]
-#   report: html
-"""
+def example_dir(kind: CampaignType) -> Path:
+    path = EXAMPLES_DIR / kind.folder
+    if not (path / "campaign.yaml").is_file():
+        raise FileNotFoundError(
+            f"no example campaign at {path}. `csp init` copies the examples/ folder of the "
+            f"cspflow checkout, so cspflow must be installed from it (pip install -e .).")
+    return path
 
-MINIMAL_HEADER = """\
-# @NAME@ -- cspflow campaign.  `csp init @NAME@` (without --minimal) writes
-# this file with every tunable knob listed alongside it, and copies the
-# machine profile and DFT recipe into the campaign folder so both can be
-# edited.  `csp config defaults` prints the defaults in force here.
-"""
+
+# --------------------------------------------------------------------------
+# editing the example's campaign.yaml
+# --------------------------------------------------------------------------
+
+
+def _set_value(text: str, prefix: str, value: str, *, current: str = r"\S+") -> str:
+    """Replace the value on the ONE line starting with `prefix`, keeping its comment
+    in the same column. Refuses unless exactly one line matches, so an example
+    edited out of shape fails loudly instead of scaffolding the wrong setting.
+    """
+    pattern = re.compile(rf"^({re.escape(prefix)})({current})([ \t]*#.*)?$", re.M)
+
+    def swap(m: re.Match) -> str:
+        comment = m.group(3) or ""
+        if comment:
+            width = len(m.group(2)) + (len(comment) - len(comment.lstrip()))
+            comment = " " * max(1, width - len(value)) + comment.lstrip()
+        return f"{m.group(1)}{value}{comment}"
+
+    new, n = pattern.subn(swap, text)
+    if n != 1:
+        raise ValueError(f"expected exactly one line starting {prefix!r} in the example, found {n}")
+    return new
+
+
+def _banner(kind: CampaignType, name: str) -> str:
+    return (
+        "# ===========================================================================\n"
+        f"#  {name} -- cspflow campaign, {kind.label}\n"
+        f"#  \"{kind.question}\"\n"
+        "#\n"
+        f"#  Made by `csp init {kind.number} {name}` from examples/{kind.folder}/.\n"
+        "#    campaign.yaml   what to search, and how hard        <- you are here\n"
+        "#    machine.yaml    scheduler, partitions, codes, POTCAR trees\n"
+        "#    recipe.yaml     the DFT ladder: INCAR tags, k-points, resources\n"
+        "#    inputs/         your own structures or composition lists\n"
+        "#    results/        everything the campaign produces\n"
+        "#\n"
+        "#  Every line that is not a comment is a live setting, written out even where\n"
+        "#  it equals the default. Where a setting takes one of a fixed set of values,\n"
+        "#  the others are listed beside it as  # a | b | c.  To see every resolved\n"
+        "#  value and which file set it:   csp config show --origins\n"
+        "# ===========================================================================\n"
+    )
+
+
+def _drop_banner(text: str) -> str:
+    """Remove the example's own leading comment block ("EXAMPLE 1 of 3 ...")."""
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and lines[i].startswith("#"):
+        i += 1
+    return "".join(lines[i:]).lstrip("\n")
+
+
+def _strip_comments(text: str) -> str:
+    """Drop whole-line and trailing comments, collapsing the gaps.
+
+    This is what makes `--minimal` safe: the terse file is the annotated file
+    with the annotations removed, so a knob can never exist in one and not the
+    other. A trailing comment is recognised by the two spaces before its `#`,
+    which is how every example writes them.
+    """
+    kept = []
+    for line in text.splitlines():
+        if re.match(r"\s*#", line):
+            continue
+        kept.append(re.sub(r"\s{2,}#.*$", "", line))
+    out: list[str] = []
+    for line in kept:
+        if not line.strip() and (not out or not out[-1].strip()):
+            continue
+        out.append(line)
+    return "\n".join(out).strip() + "\n"
+
+
+def campaign_yaml(kind: CampaignType | int | str, *, name: str,
+                  machine: str = "machine.yaml", recipe: str = "recipe.yaml",
+                  minimal: bool = False, reference_mode: str | None = None) -> str:
+    """The campaign file for `kind`: the example's, with four lines changed.
+
+    `reference_mode` is the answer to the one question `csp init` asks -- whether
+    the MP reference phases get recomputed at this campaign's own DFT settings
+    (D126). It is written as the live value of `reference.mode`.
+    """
+    ctype = kind if isinstance(kind, CampaignType) else parse_type(str(kind))
+    if ctype is None:
+        raise ValueError(f"unknown campaign type {kind!r}; expected 1, 2 or 3")
+    text = (example_dir(ctype) / "campaign.yaml").read_text()
+
+    text = _set_value(text, "name: ", name)
+    text = _set_value(text, "machine: ", machine)
+    text = _set_value(text, "  recipe: ", recipe)
+    if reference_mode is not None:
+        if reference_mode not in ("recompute", "mp_energies"):
+            raise ValueError("reference_mode must be 'recompute' or 'mp_energies'")
+        text = _set_value(text, "  mode: ", reference_mode, current=r"recompute|mp_energies")
+
+    if minimal:
+        header = (f"# {name} -- cspflow campaign, {ctype.label}. `csp init {ctype.number} {name}`\n"
+                  "# without --minimal writes this file with every setting's alternatives\n"
+                  "# beside it, plus editable copies of the machine profile and DFT recipe.\n")
+        return header + "\n" + _strip_comments(text)
+    return _banner(ctype, name) + "\n" + _drop_banner(text)
+
+
+def example_inputs(kind: CampaignType) -> list[tuple[str, Path]]:
+    """(path relative to the campaign, source file) for the example's demo inputs."""
+    root = example_dir(kind)
+    inputs = root / "inputs"
+    if not inputs.is_dir():
+        return []
+    return [(str(p.relative_to(root)), p) for p in sorted(inputs.rglob("*")) if p.is_file()]
+
+
+# --------------------------------------------------------------------------
+# READMEs
+# --------------------------------------------------------------------------
+
 
 README = """\
 # @NAME@
 
-A cspflow campaign. Four files, and you can edit all of them.
+A cspflow campaign, @LABEL@ -- "@QUESTION@".
+Made by `csp init @NUMBER@ @NAME@` from `examples/@FOLDER@/`.
 
 | file | what you change there |
 |------|-----------------------|
 | `campaign.yaml` | what to search, how many structures, the hull cutoff |
 | `machine.yaml`  | partition, walltime, modules, VASP binary, POTCAR trees |
 | `recipe.yaml`   | the DFT ladder: INCAR tags, k-point density, resources |
-| `inputs/`       | your own structures (`structure_list`) or composition lists |
+| `inputs/`       | @INPUTS@ |
 
-Outputs are not in this folder -- they go to `workdir` on scratch, because
-they get large. After the first run, `results/` here is a symlink to it, and
-`csp report` writes `report/` here.
+Everything the campaign produces -- the database, the screening results, every
+DFT directory -- goes in `results/` inside this folder.
+
+## Edit first
+
+@EDIT_FIRST@
 
 ## Run it
 
@@ -213,8 +258,8 @@ they get large. After the first run, `results/` here is a symlink to it, and
 conda activate cspflow
 csp doctor                    # check machine, codes, POTCARs, env
 csp source --dry-run          # what would be searched, before anything runs
-csp run --through calibrate   # Phase A: cheap, runs to completion
-csp run --from filter --watch # Phase B: expensive, streamed under budget
+csp run --through reference   # Phase A: cheap, runs to completion
+csp run --from filter --watch # Phase B: expensive, streamed under max_cores
 csp status                    # where everything is
 csp report                    # report/report.html + report/candidates.csv
 ```
@@ -230,54 +275,58 @@ csp config show --origins     # every resolved value, and which file set it
 ```
 """
 
-INPUTS_README = """\
-Put your own input here.
+_INPUTS_LINE = {
+    1: "nothing -- a chemical_space campaign names its elements in campaign.yaml",
+    2: "`compositions.csv`: the formulas to generate (demo list; replace it)",
+    3: "`seeds/`: the structures to screen (demo Sm-Fe seeds; replace them)",
+}
 
-* `structure_list` campaigns read POSCAR/CIF/extxyz from a folder named in
-  `campaign.yaml`, e.g. `paths: [inputs/seeds]`.
-* Composition lists can live here too, as YAML, and be referenced the same way.
+_INPUTS_README = {
+    1: """\
+A chemical_space campaign reads nothing from here: its elements are the
+`source.chemical_space.groups` in campaign.yaml.
 
-Anything in this folder is yours; cspflow never writes to it.
-"""
+Put anything you want kept beside the campaign here -- cspflow never writes to
+this folder. Adding a second source that does read files (a composition CSV or
+a folder of seeds) is how a sweep gets a hand-picked control group.
+""",
+    2: """\
+`compositions.csv` is the example's DEMO list, copied by `csp init`.
+Replace it with your own formulas.
 
+Format:  formula[,z_min,z_max,n_structures]
+A header row is optional, blank cells inherit from `source.defaults`, and `#`
+comments must be on a line of their own -- a trailing comment after data is read
+as part of the last cell.
 
-def _fill(text: str, *, name: str, machine: str = "orion", recipe: str = "magnets") -> str:
-    return (text.replace("@NAME@", name)
-                .replace("@MACHINE@", machine)
-                .replace("@RECIPE@", recipe))
+`csp source --dry-run` shows what the list expands to. cspflow never writes to
+this folder.
+""",
+    3: """\
+`seeds/` holds the example's five DEMO structures (DFT-relaxed Sm-Fe phases),
+copied by `csp init`. Replace them with your own files.
 
+Read: .vasp .poscar .contcar .cif .xyz .extxyz .res .json, and any file named
+POSCAR or CONTCAR. Anything else in the folder is ignored, so a README beside
+your seeds is fine. Every file is parsed by both pymatgen and ASE, and the two
+must agree on its composition.
 
-def _strip_comments(text: str) -> str:
-    """Drop whole-line comments, keeping trailing ones and collapsing the gaps.
-
-    This is what makes `--minimal` safe: the terse file is the annotated file
-    with the annotations removed, so a knob can never exist in one and not the
-    other.
-    """
-    kept = [line for line in text.splitlines() if not re.match(r"\s*#", line)]
-    out: list[str] = []
-    for line in kept:
-        if not line.strip() and (not out or not out[-1].strip()):
-            continue
-        out.append(line)
-    return "\n".join(out).strip() + "\n"
-
-
-def campaign_yaml(*, name: str, machine: str = "orion", recipe: str = "magnets",
-                  minimal: bool = False) -> str:
-    """The campaign file: annotated by default, terse on request."""
-    body = _fill(CAMPAIGN, name=name, machine=machine, recipe=recipe)
-    if not minimal:
-        return body
-    return _fill(MINIMAL_HEADER, name=name) + "\n" + _strip_comments(body)
-
-
-def workspace_readme(*, name: str) -> str:
-    return _fill(README, name=name)
+Check `structure_list.max_atoms` in campaign.yaml clears your largest seed.
+`csp source --dry-run` lists what was read. cspflow never writes to this folder.
+""",
+}
 
 
-def inputs_readme() -> str:
-    return INPUTS_README
+def workspace_readme(kind: CampaignType, *, name: str) -> str:
+    edit = "\n".join(f"* `{line.split()[0]}` {' '.join(line.split()[1:])}" for line in kind.edit_first)
+    return (README.replace("@NAME@", name).replace("@LABEL@", kind.label)
+                  .replace("@QUESTION@", kind.question).replace("@NUMBER@", str(kind.number))
+                  .replace("@FOLDER@", kind.folder).replace("@INPUTS@", _INPUTS_LINE[kind.number])
+                  .replace("@EDIT_FIRST@", edit))
+
+
+def inputs_readme(kind: CampaignType) -> str:
+    return _INPUTS_README[kind.number]
 
 
 def machine_copy(source: Path, *, name: str) -> str:

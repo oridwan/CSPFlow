@@ -13,7 +13,10 @@ from pathlib import Path
 from ..config.loader import ResolvedConfig
 from .base import Stage, StageReport, WorkItem
 from .analyze_stage import AnalyzeStage
-from .calibrate_stage import CalibrateStage
+# CalibrateStage is no longer part of the funnel (D126).  The module is kept
+# because it records the measurement that retired it, and because
+# `calibrate:` blocks in existing campaign.yaml files must still parse.
+from .calibrate_stage import CalibrateStage  # noqa: F401
 from .dedup_stage import DedupStage
 from .dft_stage import DftStage
 from .filter_stage import FilterStage
@@ -26,7 +29,7 @@ __all__ = ["Stage", "StageReport", "WorkItem", "AnalyzeStage", "CalibrateStage",
            "build_registry", "IMPLEMENTED", "PLANNED"]
 
 # What exists today, in funnel order.
-IMPLEMENTED = ["source", "generate", "screen", "dedup", "reference", "calibrate",
+IMPLEMENTED = ["source", "generate", "screen", "dedup", "reference",
                "filter", "dft", "analyze"]
 
 # What does not, and which milestone brings it. Named here so `csp run` can say
@@ -42,5 +45,5 @@ def build_registry(cfg: ResolvedConfig, base_dir: Path | None = None) -> list[St
     if cfg.campaign.generate is not None:
         stages.append(GenerateStage(cfg))
     return stages + [ScreenStage(cfg), DedupStage(cfg),
-            ReferenceStage(cfg), CalibrateStage(cfg),
+            ReferenceStage(cfg),
             FilterStage(cfg), DftStage(cfg), AnalyzeStage(cfg)]

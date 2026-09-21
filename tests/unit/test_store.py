@@ -83,7 +83,7 @@ def test_enum_values_are_accepted(store):
 def test_open_rejects_a_foreign_database(tmp_path):
     p = tmp_path / "other.db"
     sqlite3.connect(str(p)).execute("CREATE TABLE x (i INTEGER)")
-    with pytest.raises(StoreError, match="not a cspflow database"):
+    with pytest.raises(StoreError, match="carries no cspflow schema"):
         Store.open(p)
 
 
@@ -353,6 +353,33 @@ class TestRelaxationOutcomes:
             outcomes = s.relaxation_outcomes()
         assert outcomes == {"vasp:relax:converged": 1, "vasp:relax:not converged": 2}
 
+    def test_a_retry_that_converged_is_not_still_counted_as_a_failure(self, tmp_path):
+        """`relaxation` is attempt history, so one structure can hold both kinds.
+
+        The old count was COUNT(*) over rows, so a structure that hit the ionic
+        step limit, was retried from CONTCAR and then converged was reported in
+        BOTH lines -- and the "not converged" line is read as "these are broken".
+        CePdGe showed 34 such rows against 24 genuinely unconverged structures
+        (D134). Every fixture above uses one row per structure, which cannot tell
+        rows from structures, which is why this went unseen.
+        """
+        from cspflow.db.store import Store
+
+        with Store.create(tmp_path / "c.db", campaign="t") as s:
+            # sid 1: hit the step limit, retried, converged. ONE structure.
+            s.add_relaxation(structure_id=1, engine="vasp:relax", converged=False)
+            s.add_relaxation(structure_id=1, engine="vasp:relax", energy=-1.0, converged=True)
+            # sid 2: failed twice and never converged. Still ONE structure.
+            s.add_relaxation(structure_id=2, engine="vasp:relax", converged=False)
+            s.add_relaxation(structure_id=2, engine="vasp:relax", converged=False)
+            outcomes = s.relaxation_outcomes()
+
+        assert outcomes == {
+            "vasp:relax:converged": 1,       # sid 1, despite its failed attempt
+            "vasp:relax:not converged": 1,   # sid 2 only -- not 3 failed rows
+            "vasp:relax:retried": 1,         # sid 1 got there the hard way
+        }
+
     def test_summary_carries_the_split_and_the_core_hours(self, tmp_path):
         from cspflow.db.store import Store
 
@@ -380,3 +407,68 @@ def test_a_reused_scheduler_id_is_refused(tmp_path):
         store.update_job(row, state="queued", slurm_id="local-1")
         with pytest.raises(StoreError, match="already recorded for stage"):
             store.assert_job_id_is_new("local-1", "screen", "/w/screen")
+
+
+
+def test_a_stale_main_file_with_a_live_wal_says_what_that_means(tmp_path):
+    """An existing campaign can read back EMPTY without being damaged.
+
+    WAL keeps recent writes in `-wal`, indexed through `-shm`, which is shared
+    memory and coherent only within one host. Read the same file from a second
+    node over NFS and you get the stale main file instead. Seen 2026-09-12:
+    `csp status` on str-c6 against a CeFeB database whose driver held it on
+    str-c221 -- main file two hours old, `-wal` 4.2 MB and thirty seconds old,
+    campaign perfectly healthy and still submitting.
+
+    The old message was "is not a cspflow database", which points at the file
+    when the file is fine.
+    """
+    from cspflow.db.store import _no_schema_message
+
+    db = tmp_path / "campaign.db"
+    sqlite3.connect(str(db)).execute("CREATE TABLE x (i INTEGER)")
+    (tmp_path / "campaign.db-wal").write_bytes(b"x" * 4096)
+
+    msg = _no_schema_message(db)
+    assert "ANOTHER NODE" in msg
+    assert "Your data is fine" in msg
+    assert "4,096 bytes" in msg
+    # Both timestamps, so the staleness is visible rather than asserted.
+    assert msg.count("last written") == 2
+
+
+def test_without_a_wal_it_does_not_blame_the_network(tmp_path):
+    """The WAL explanation must not become boilerplate on every empty file."""
+    from cspflow.db.store import _no_schema_message
+
+    db = tmp_path / "campaign.db"
+    sqlite3.connect(str(db)).execute("CREATE TABLE x (i INTEGER)")
+
+    msg = _no_schema_message(db)
+    assert "ANOTHER NODE" not in msg
+    assert "carries no cspflow schema" in msg
+
+
+def test_number_like_string_kv_is_refused_with_the_fix_in_the_message(tmp_path):
+    """ASE's own error names only the value, so a caller cannot tell which key broke.
+
+    Regression for the source-stage crash on a 14,777-seed campaign: a bare 16-char
+    sha256 prefix is number-like about once in 600, and `--dry-run` cannot catch it
+    because a dry run never writes.
+    """
+    from cspflow.db.store import Store, StoreError
+    from ase.build import bulk
+
+    store = Store(tmp_path / "campaign.db")
+    for bad in ("35720269025179e3", "4516549686969335", "1e5", "True"):
+        with pytest.raises(StoreError) as exc:
+            store.add_structure(bulk("Fe"), origin="seed", state="new",
+                                content_hash=bad)
+        msg = str(exc.value)
+        assert "content_hash" in msg, "the message must name the key"
+        assert f"sha256:{bad}" in msg, "the message must show the fix"
+
+    # the prefixed form is accepted
+    sid = store.add_structure(bulk("Fe"), origin="seed", state="new",
+                              content_hash="sha256:35720269025179e3")
+    assert sid > 0

@@ -226,6 +226,27 @@ class ResolvedConfig:
         return self.campaign_path.parent if self.campaign_path else Path.cwd()
 
     @property
+    def work_dir(self) -> Path:
+        """Where this campaign's OUTPUT goes, as an absolute path.
+
+        A relative `workdir` resolves against the campaign folder, so the
+        default `workdir: results` puts everything -- database, screen results,
+        DFT directories -- inside the campaign folder itself.  ONE place.
+
+        It used to be a required absolute path pointing at a separate scratch
+        tree, which left a campaign in two roots plus an `archive` third that
+        was configured and never created.  A `results` symlink papered over the
+        split, and the split still leaked: the database sat on scratch while
+        campaign.yaml and inputs/ sat elsewhere, and `csp status` run from the
+        wrong directory reported a different campaign than `csp run`.
+
+        An absolute `workdir` still works and still means exactly what it says,
+        for a campaign whose output genuinely belongs on a different filesystem.
+        """
+        raw = Path(self.campaign.workdir).expanduser()
+        return raw if raw.is_absolute() else (self.base_dir / raw).resolve()
+
+    @property
     def campaign_db(self) -> Path:
         """Where this campaign's database lives.
 
@@ -233,7 +254,7 @@ class ResolvedConfig:
         driver, the CLI and every stage must agree on it, and a stage that
         guessed differently would quietly build a second, empty campaign.
         """
-        return Path(self.campaign.workdir) / "campaign.db"
+        return self.work_dir / "campaign.db"
 
     @property
     def config_hash(self) -> str:

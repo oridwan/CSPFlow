@@ -1,12 +1,13 @@
 """The campaign folder: what `csp init` writes, and how it resolves.
 
 A campaign is a folder -- campaign.yaml plus editable copies of the machine
-profile and the DFT recipe -- so the two things worth testing are that the
-folder is complete and that a relative path inside it means "beside the
-campaign file" from anywhere you might run the command.
+profile and the DFT recipe -- made from one of three example campaigns by
+`csp init <TYPE> <NAME>`. The things worth testing are that the folder is
+complete for each type, that init and the example cannot drift, and that a
+relative path inside it means "beside the campaign file" from anywhere you
+might run the command.
 """
 
-import re
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from typer.testing import CliRunner
 from cspflow.cli import _find_campaign, app
 from cspflow.config.loader import ConfigError, load_campaign, resolve_machine_path
 from cspflow.dft.recipe import load_recipe
-from cspflow.templates import campaign_yaml
+from cspflow.templates import EXAMPLES_DIR, campaign_yaml
 
 runner = CliRunner()
 
@@ -24,9 +25,9 @@ WORKSPACE = {"campaign.yaml", "machine.yaml", "recipe.yaml",
              "README.md", "inputs/README.md"}
 
 
-def _init(tmp_path: Path, *args: str):
-    result = runner.invoke(app, ["init", "demo", "-d", str(tmp_path / "demo"),
-                                 "-m", "local", *args])
+def _init(tmp_path: Path, *args: str, kind: str = "1"):
+    result = runner.invoke(app, ["init", kind, "demo", "-d", str(tmp_path / "demo"),
+                                 "-m", "local", "--no-recompute-reference", *args])
     assert result.exit_code == 0, result.output
     return tmp_path / "demo"
 
@@ -58,52 +59,74 @@ def test_minimal_writes_only_the_campaign_file(tmp_path):
 def test_existing_files_are_not_clobbered(tmp_path):
     root = _init(tmp_path)
     (root / "campaign.yaml").write_text("name: mine\n")
-    result = runner.invoke(app, ["init", "demo", "-d", str(root), "-m", "local"])
+    result = runner.invoke(app, ["init", "1", "demo", "-d", str(root), "-m", "local"])
     assert result.exit_code == 1
     assert (root / "campaign.yaml").read_text() == "name: mine\n"
 
 
-# --- the annotated and terse files cannot drift ----------------------------
+# --- the three types ------------------------------------------------------
 
-def test_minimal_is_the_annotated_file_with_the_comments_removed(tmp_path):
+def test_type_2_and_3_bring_the_example_inputs(tmp_path):
+    """A scaffold whose `from_file` / `paths` point at nothing cannot dry-run."""
+    two = _init(tmp_path / "a", kind="2")
+    assert (two / "inputs" / "compositions.csv").read_bytes() == (
+        EXAMPLES_DIR / "2-composition-list" / "inputs" / "compositions.csv").read_bytes()
+    three = _init(tmp_path / "b", kind="3")
+    assert len(list((three / "inputs" / "seeds").glob("*.vasp"))) == 5
+
+
+@pytest.mark.parametrize("kind,mode", [("1", "chemical_space"), ("2", "composition_list"),
+                                       ("3", "structure_list"), ("seeds", "structure_list")])
+def test_each_type_scaffolds_its_own_source_mode(tmp_path, kind, mode):
+    root = _init(tmp_path, kind=kind)
+    cfg = load_campaign(root / "campaign.yaml")
+    assert cfg.campaign.name == "demo"
+    assert [s.mode.value for s in cfg.campaign.source] == [mode]
+    assert (cfg.campaign.generate is None) == (mode == "structure_list")
+
+
+def test_init_is_the_example_with_only_four_lines_changed(tmp_path):
+    """The example IS the template. Anything but name, machine, recipe and the
+    reference answer differing means the two have started to drift."""
+    for kind, folder in [("1", "1-chemical-space"), ("2", "2-composition-list"),
+                         ("3", "3-structure-list")]:
+        made = yaml.safe_load(campaign_yaml(kind, name="demo", reference_mode="mp_energies"))
+        example = yaml.safe_load((EXAMPLES_DIR / folder / "campaign.yaml").read_text())
+        assert made.pop("name") == "demo"
+        example.pop("name")
+        assert made["reference"].pop("mode") == "mp_energies"
+        example["reference"].pop("mode")
+        assert made == example, folder
+
+
+@pytest.mark.parametrize("kind", ["1", "2", "3"])
+def test_minimal_is_the_annotated_file_with_the_comments_removed(kind):
     """Same keys, both parse. `--minimal` is a view, not a second template."""
-    full = yaml.safe_load(campaign_yaml(name="demo"))
-    terse = yaml.safe_load(campaign_yaml(name="demo", minimal=True))
-    assert full == terse
+    full = yaml.safe_load(campaign_yaml(kind, name="demo"))
+    terse = campaign_yaml(kind, name="demo", minimal=True)
+    assert full == yaml.safe_load(terse)
+    body = [line for line in terse.splitlines() if not line.startswith("#")]
+    assert not any("#" in line for line in body), "a trailing comment survived"
 
 
-def _uncomment_knobs(text: str) -> str:
-    """Delete the leading "# " from every commented-out YAML line.
-
-    This is the property the template promises: a knob is enabled by deleting
-    two characters, and what is left is valid YAML at the right depth. Prose
-    comments are left alone -- an indented comment is legal YAML wherever it
-    sits, so leaving them costs nothing.
-    """
-    knob = re.compile(r"\s*(-\s+)?[A-Za-z_]\w*:|\s*-\s+\{")
-    return "\n".join(
-        line[2:] if line.startswith("# ") and knob.match(line[2:]) else line
-        for line in text.splitlines()
-    )
+def test_one_argument_is_a_name_and_the_type_is_asked_for(tmp_path):
+    """`csp init my-campaign`, the old form: no terminal to ask on -> the menu."""
+    result = runner.invoke(app, ["init", "demo", "-d", str(tmp_path / "demo")])
+    assert result.exit_code == 1
+    for line in ("chemical_space", "composition_list", "structure_list", "csp init <1|2|3> demo"):
+        assert line in result.output
+    assert not (tmp_path / "demo").exists(), "nothing is written before the type is known"
 
 
-def test_uncommenting_every_knob_leaves_a_valid_campaign():
-    """A knob the schema rejects, or one indented under the wrong parent, is a
-    trap: the user deletes two characters and gets an error they did not write.
-
-    `extra="forbid"` makes this catch a renamed key, a key at the wrong depth,
-    and a key that never existed -- the three ways a hand-written template goes
-    stale against the schema it documents.
-    """
-    from cspflow.config.schema import Campaign
-
-    doc = yaml.safe_load(_uncomment_knobs(campaign_yaml(name="demo")))
-    campaign = Campaign.model_validate(doc)
-
-    assert campaign.screen.mattersim.max_steps == 500      # nested, not top level
-    assert campaign.dft.select.max_total == 1500
-    assert {s.mode.value for s in campaign.source} == {
-        "chemical_space", "composition_list", "structure_list"}
+@pytest.mark.parametrize("argv,expect", [
+    (["init"], "csp init <1|2|3> <name>"),
+    (["init", "2"], "csp init 2 <name>"),
+    (["init", "7", "demo"], "unknown campaign type '7'"),
+])
+def test_an_incomplete_init_prints_the_menu(argv, expect):
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 1
+    assert expect in result.output and "structure_list" in result.output
 
 
 # --- resolution ------------------------------------------------------------

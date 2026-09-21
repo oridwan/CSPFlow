@@ -63,6 +63,10 @@ stages:
       - when: ionic_step_limit
         set: {NSW: 200}
         remedy: resume_from_contcar
+      - when: out_of_memory
+        # `--mem` is estimated per structure now, but an estimate can miss. This
+        # is the rung that catches the miss instead of failing the structure.
+        resources: {mem: 64G}
 
   - name: static
     inherit: relax          # copies every tag above, then overrides
@@ -73,3 +77,13 @@ stages:
       EDIFF:   1.0e-6
       LCHARG:  .TRUE.
     resources: {role: cpu, ntasks: 64, time: "12:00:00"}
+    # The static stage had no retry ladder at all, so ANY failure here was
+    # terminal -- including the three CeFeB statics killed by the OOM that
+    # `--mem` estimation now prevents. A stage that can fail needs rungs.
+    retry:
+      - when: out_of_memory
+        resources: {mem: 64G}
+      - when: timeout
+        resources: {time: "24:00:00"}
+      - when: scf_not_converged
+        set: {ALGO: Normal, NELM: 300}

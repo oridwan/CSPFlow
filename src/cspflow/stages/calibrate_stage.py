@@ -1,4 +1,21 @@
-"""Stage 4a -- `calibrate:mp`, the free calibration.
+"""RETIRED 2026-09-12 (D126).  Not in the funnel; kept for the record.
+
+**Why it is gone.**  4a compared MatterSim against MP's DFT.  That comparison
+mattered because the hull that filtered candidates mixed the two: MatterSim
+energies for the candidates, MP energies for the vertices.  The vertices are
+now MatterSim as well (`reference_stage._vertices`), so both sides of that hull
+carry the same model's zero and there is no longer a gap to measure.
+
+Measured on the store before the change, the mixed hull misplaced roughly a
+third of candidates in Ce chemistry by more than the 0.06 eV/atom selection
+threshold (Ce-Ge-Pd 20/64, Ce-Cu-Ge 21/66, Ce-Ge-Sb 23/62, Fe-Pd 0/20).  The
+fix was to remove the mixing, not to keep measuring it.
+
+4b was already off by default (D119).  Everything below is the original text.
+
+---
+
+Stage 4a -- `calibrate:mp`, the free calibration.
 
 Runs on MP phases the moment they are fetched, **before** the MLIP relaxes
 anything, and needs nothing from the candidates. So it can run at the very start,
@@ -16,11 +33,21 @@ number that looks like a result and changes nothing.
 
 **What it cannot replace.** Universal MLIPs of this class are trained on
 MP-derived trajectories, so MP phases are close to in-distribution and 4a is
-substantially a self-consistency check. It catches gross failure, not subtle
-bias. The structures the campaign actually cares about are *generated*, often in
-prototypes absent from MP — that is the out-of-distribution set, and only
-`calibrate:pilot` (4b) tests the model there. Which is why 4a defaults to
-`warn` and 4b to `block`.
+substantially a self-consistency check against MP's own numbers. It catches
+gross failure, not subtle bias.
+
+**Where 4b went (D119).** 4b compared the MLIP against OUR DFT on a pilot set
+of generated candidates, and used to `block` the expensive tier until it
+returned. It is now `off` by default, because the reference set carries both
+MatterSim and our own DFT for 2,711 phases — so that comparison is available
+before a campaign starts, on 68x the sample 4b's default 40 would have given
+(MAE 0.0355 eV/atom, Spearman 0.970 on formation energy).
+
+What that does not buy is the out-of-distribution question: those 2,711 are MP
+phases, and the structures a campaign cares about are *generated*, often in
+prototypes absent from MP. 4b was the only thing that tested the model there,
+so `calibrate: {pilot: {on_fail: block}}` is still the right setting for a
+chemistry the reference set does not cover.
 """
 
 from __future__ import annotations

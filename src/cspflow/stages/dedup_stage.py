@@ -45,7 +45,10 @@ class DedupStage:
         self.include_seeds = include_seeds
 
     def pending(self, store: Store) -> int:
-        return len(self._eligible(store))
+        # Counted in SQL, not by reading the pool: this is asked every cycle,
+        # and reading 14,752 structures to count unflagged ones took 59 s on
+        # nfs4 (D144). Same rule as `_eligible`.
+        return store.count_in_state_lacking(StructureState.screened, CHECKED_KEY)
 
     def claim(self, store, budget):                        # pragma: no cover
         raise AssertionError("dedup is an in-process stage; the driver calls run()")
@@ -56,11 +59,16 @@ class DedupStage:
     def reconcile(self, store, job_row, status, items):    # pragma: no cover
         pass
 
+    #: Structures flagged per commit. Small enough that the write lock is held
+    #: for seconds on NFS, not for the whole pool (D144).
+    WRITE_CHUNK = 1000
+
     def run(self, store: Store) -> StageReport:
-        if not self._eligible(store):
+        if not self.pending(store):
             return StageReport(stage=self.name, note="nothing to compare")
         # Compare over the whole pool, not only the new arrivals: a structure
         # that duplicates one accepted three cycles ago is still a duplicate.
+        # Read ONCE -- `_eligible` and `_pool` each used to read it again.
         rows = self._pool(store)
 
         matcher = self._matcher()
@@ -72,7 +80,13 @@ class DedupStage:
         for row in rows:
             by_formula[row.toatoms().get_chemical_formula()].append(row)
 
-        dropped, groups, kept_seeds = 0, 0, 0
+        # Decide everything first, write nothing. SQLite takes the write lock at
+        # the first write and keeps it to the commit, so writing inside this
+        # loop held it for the whole of the structure matching -- minutes, on a
+        # large pool, against a second driver on the same campaign (D144).
+        collisions: list[tuple[int, int]] = []
+        duplicates_of: list[tuple[int, int]] = []
+        groups = 0
         for formula, members in sorted(by_formula.items()):
             if len(members) < 2:
                 continue
@@ -84,28 +98,34 @@ class DedupStage:
                     if row.get("origin") == Origin.seed.value and not self.include_seeds:
                         # Two seeds that match are a *result* -- a relaxed and an
                         # unrelaxed copy of one prototype, say. Recorded, kept.
-                        kept_seeds += 1
-                        store.add_filter_event(
-                            structure_id=int(row.id), gate="dedup:seed_collision",
-                            passed=True, detail=f"matches structure {survivor.id}; kept",
-                        )
-                        continue
-                    store.set_structure_state(
-                        int(row.id), StructureState.deduped,
-                        duplicate_of=int(survivor.id),
-                    )
-                    store.add_filter_event(
-                        structure_id=int(row.id), gate="dedup",
-                        passed=False, detail=f"duplicate of structure {survivor.id}",
-                    )
-                    dropped += 1
+                        collisions.append((int(row.id), int(survivor.id)))
+                    else:
+                        duplicates_of.append((int(row.id), int(survivor.id)))
+
+        with store.transaction():
+            for sid, survivor in collisions:
+                store.add_filter_event(
+                    structure_id=sid, gate="dedup:seed_collision",
+                    passed=True, detail=f"matches structure {survivor}; kept",
+                )
+            for sid, survivor in duplicates_of:
+                store.set_structure_state(sid, StructureState.deduped,
+                                          duplicate_of=survivor)
+                store.add_filter_event(
+                    structure_id=sid, gate="dedup",
+                    passed=False, detail=f"duplicate of structure {survivor}",
+                )
 
         # Mark everything that was compared, survivors included. A survivor
         # keeps its `screened` state -- `filter` and `reference` read that, and
         # `deduped` means "removed as a duplicate" -- but it must not be
-        # compared again.
-        for row in rows:
-            store.update_structure(int(row.id), **{CHECKED_KEY: True})
+        # compared again. In chunks, one commit each.
+        ids = [int(row.id) for row in rows]
+        for start in range(0, len(ids), self.WRITE_CHUNK):
+            with store.transaction():
+                for sid in ids[start:start + self.WRITE_CHUNK]:
+                    store.update_structure(sid, **{CHECKED_KEY: True})
+        dropped, kept_seeds = len(duplicates_of), len(collisions)
 
         note = f"{groups} duplicate group(s)"
         if kept_seeds:

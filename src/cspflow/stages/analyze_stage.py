@@ -18,10 +18,20 @@ phase in the same system, including other candidates of ours.  A candidate
 placed against a hull that was missing a phase computed an hour later is simply
 wrong, and re-placing is cheap.
 
-The hull is built on *our* energies plus the MP reference entries on the same
-scale.  Mixing our GGA numbers with MP's corrected ones would put the error of
-the correction scheme straight into `e_above_hull`; `reference/hull.py` refuses
-that outright, and this stage does not try to talk it round.
+The hull is built on one energy scale, and `reference.mode` says which:
+
+    recompute     (default) our own recomputed reference phases, read from the
+                  shared cache by `recipe_id`.  One scale throughout.  If any
+                  phase in a system is missing, that system is REFUSED and
+                  reported -- never topped up from MP, because a hull with one
+                  borrowed vertex still builds and looks exactly like a correct
+                  one.
+    mp_energies   MP's own numbers.  Legitimate for a pre-screen or a new
+                  chemistry where nothing has been recomputed yet, but it puts
+                  two absolute scales on one hull, so it says so on the report.
+
+Mixing our GGA numbers with MP's *corrected* ones is a third thing again, and
+`reference/hull.py` refuses it outright whatever the mode.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ from ..analysis.properties import extract
 from ..chem import canonical_formula, chemsys
 from ..config.loader import ResolvedConfig
 from ..db.store import Store, StructureState
+from ..reference.computed import ComputedError
 from ..reference.hull import Entry, HullError, build_hull
 from .base import StageReport, WorkItem
 
@@ -42,10 +53,11 @@ DIR_KEY = "dft_dir"
 # not re-read a 10 MB OUTCAR for every finished structure in the campaign.
 DONE_KEY = "analyzed"
 
-# Said once per run, not once per structure.
+# Said once per run, not once per structure -- and now only on
+# `reference.mode: mp_energies`, which is the explicit choice to accept the
+# mixing this describes.  Until D101 was wired up (see `_reference_entries`)
+# `mode` decided nothing and every hull mixed scales regardless of the config.
 #
-# `reference.mode` defaults to `recompute` and is wired to nothing, so the DFT
-# hull is built from our energies against MP's -- two different absolute scales.
 # Measured 2026-08-27 by running four MP structures through this campaign's own
 # settings, as a static at MP's own geometry:
 #
@@ -62,6 +74,17 @@ DONE_KEY = "analyzed"
 # volume within 0.17%, RMS 0.002 A). It was reported at 0.2098 eV/atom above the
 # hull. Subtract its measured offset and it is +0.023 -- on the hull, where the
 # reference phase must be.
+MIXED_SCALE_REFUSAL = (
+    "no DFT hull for this system: reference.mode='mp_energies' would put our "
+    "DFT energies on MP's vertices, and the two are not the same scale. "
+    "Measured on the store 2026-09-12, a per-element correction fitted inside "
+    "one chemistry still leaves 42 meV/atom RMS for Ce-Ge-Pd and 103 for "
+    "Ce-Fe-B, against a 60 meV/atom selection threshold -- elemental Ce alone "
+    "is +1.17 eV/atom ours-minus-MP, a different 4f POTCAR. Rank on the MLIP "
+    "hull (whole, one scale), or add this system to $CSPFLOW_STORE and set "
+    "reference.mode='recompute'. See DECISIONS.md D101, D126."
+)
+
 SCALE_WARNING = (
     "e_above_hull mixes our DFT with MP's on one hull. Measured on four MP "
     "structures through these settings, that is a per-element offset near "
@@ -74,8 +97,29 @@ class AnalyzeStage:
     role = "cpu"
     in_process = True
 
-    def __init__(self, cfg: ResolvedConfig) -> None:
+    def __init__(self, cfg: ResolvedConfig, recipe: Any = None) -> None:
         self.cfg = cfg
+        self._recipe = recipe
+        self._rid: str | None = None
+
+    @property
+    def recipe_id(self) -> str:
+        """The policy hash of this campaign's DFT settings.
+
+        No longer used to FIND reference energies -- those come from the store
+        folder now (`_computed_entries`).  It is kept because it is still the
+        honest answer to "were these two runs computed the same way", which
+        `csp doctor` reports and the reference-build commands key their cache
+        on.  Loaded lazily: nothing on the hull path asks for it.
+        """
+        if self._rid is None:
+            from ..dft.recipe import load_recipe
+            from ..reference.computed import recipe_id
+
+            recipe = self._recipe or load_recipe(
+                self.cfg.campaign.dft.recipe, self.cfg.base_dir)
+            self._rid = recipe_id(self.cfg.campaign.dft, recipe)
+        return self._rid
 
     # -- what is ready -----------------------------------------------------
 
@@ -136,7 +180,14 @@ class AnalyzeStage:
             if props.warnings:
                 kv["analyze_note"] = "; ".join(props.warnings)[:200]
                 problems.append(f"{sid}: {props.warnings[0]}")
-            store.update_structure(sid, **kv)
+            # The per-site table goes in `data`, not in key-values: it is a
+            # list of dicts, and it is what the report's structure cards draw
+            # when the scratch directory has been cleaned away.
+            blob = props.as_data()
+            if blob:
+                store.update_structure(sid, data=blob, **kv)
+            else:
+                store.update_structure(sid, **kv)
 
             for key, value in (("m_dft_raw", props.m_dft_raw),
                                ("m_s_reconstructed", props.m_s_reconstructed),
@@ -178,11 +229,26 @@ class AnalyzeStage:
 
         placed: list[str] = []
         notes: list[tuple[str, str]] = []
-        mixed_scale = False
+        on_mp = self.cfg.campaign.reference.mode == "mp_energies"
         for system, entries in sorted(ours.items()):
-            reference = self._reference_entries(store, system)
-            if reference and entries:
-                mixed_scale = True
+            if on_mp:
+                # Our DFT candidate against MP's vertices is two scales on one
+                # hull.  It used to be allowed with a warning; it is refused
+                # now, because the warning was not something a reader could act
+                # on and the error is larger than the threshold it feeds.
+                notes.append((system, MIXED_SCALE_REFUSAL))
+                self._mark_absent(store, entries, MIXED_SCALE_REFUSAL)
+                continue
+            try:
+                reference = self._reference_entries(store, system)
+            except ComputedError as exc:
+                # An incomplete system leaves `dft_e_above_hull` EMPTY rather
+                # than filled from MP -- the campaign still ranks on the MLIP
+                # hull, which is whole.  The reason is recorded per structure so
+                # a blank in the report is explainable instead of mysterious.
+                notes.append((system, str(exc)))
+                self._mark_absent(store, entries, str(exc))
+                continue
             try:
                 result = build_hull([*reference, *entries])
             except HullError as exc:
@@ -201,10 +267,22 @@ class AnalyzeStage:
                                    value=float(result.e_above_hull[entry.label]))
             placed.append(system)
 
-        summary = _summarise(notes)
-        if mixed_scale:
-            summary = (SCALE_WARNING + ("; " + summary if summary else ""))
-        return placed, summary
+        return placed, _summarise(notes)
+
+    @staticmethod
+    def _mark_absent(store: Store, entries, reason: str) -> None:
+        """Say WHY a structure has no DFT hull distance, rather than leaving a hole.
+
+        `dft_e_above_hull` stays NULL.  A reader who sees the blank can ask the
+        database what happened, and `csp report` prints it in the column instead
+        of an empty cell.
+        """
+        for entry in entries:
+            if entry.structure_id is None:
+                continue
+            store.add_property(structure_id=int(entry.structure_id),
+                               key="dft_e_above_hull_absent", source="dft",
+                               text_value=reason)
 
     @staticmethod
     def _our_entries(store: Store) -> dict[str, list[Entry]]:
@@ -223,8 +301,63 @@ class AnalyzeStage:
             out.setdefault(chemsys(counts), []).append(entry)
         return out
 
+    def _reference_entries(self, store: Store, system: str) -> list[Entry]:
+        """The hull's reference vertices, from whichever scale the config names.
+
+        This is where `reference.mode` finally does something (D101).  It had
+        defaulted to `recompute` and been wired to nothing, so every DFT hull
+        was built from our energies against MP's whatever the config said --
+        two absolute scales, and the measured gap between them is +0.15 to
+        +0.21 eV/atom, against a 0.06 eV/atom selection threshold.
+
+            recompute     our own recomputed phases, from the shared cache.
+                          Refuses if any phase is missing, rather than filling
+                          the gap from MP -- see `_computed_entries`.
+            mp_energies   MP's own numbers, and `SCALE_WARNING` on the report.
+                          An explicit, recorded choice to accept the mixing.
+
+        Stage 3's MLIP pre-screen is a different hull and stays on MP's
+        energies, which is right: MatterSim is trained on MPtrj, so MP's scale
+        is the one its numbers belong on, and the pre-screen is a wide cut
+        rather than the number anything is finally selected on.
+
+        It stays there unconditionally, though -- `reference.prescreen_mode`
+        exists in the schema and, like `mode` before D117, is read by nothing.
+        That is the same class of fault as D101 and is not fixed here; it is
+        recorded so the next person finds a note rather than a surprise.
+        """
+        if self.cfg.campaign.reference.mode == "recompute":
+            return self._computed_entries(system)
+        return self._mp_entries(store, system)
+
+    def _computed_entries(self, system: str) -> list[Entry]:
+        """Our own recomputed reference phases, read from the store FOLDER.
+
+        The store at `$CSPFLOW_STORE` is the living source of truth and it
+        keeps being extended, so the hull is built by reading it -- not from an
+        exported `computed/<recipe_id>/` copy.  A second copy of the same
+        numbers goes stale: measured 2026-09-11, that cache held 2,713 DFT
+        energies while the store held 3,408, and it was keyed to a policy the
+        store had already moved past. There is no export step now, and no
+        recipe_id.
+
+        `entries_for` still REFUSES on partial coverage, which is the whole
+        point: a hull missing one vertex still builds and nothing downstream
+        can tell it apart from a complete one. Phases in the store's
+        `ignored.json` do not count as missing -- they sit too far above the
+        hull to be vertices, so waiting for them blocks a campaign for nothing.
+
+        `reference.energy_source` picks the scale: "dft" (ours, the default),
+        "mlip" (MatterSim as we ran it), or "mp" (MP's own numbers, a different
+        scale that must never be mixed into either -- see D101).
+        """
+        from ..reference.refstore import entries_for
+
+        source = getattr(self.cfg.campaign.reference, "energy_source", "dft")
+        return entries_for(system, source)
+
     @staticmethod
-    def _reference_entries(store: Store, system: str) -> list[Entry]:
+    def _mp_entries(store: Store, system: str) -> list[Entry]:
         """MP entries for `system` and every sub-system of it.
 
         Sub-systems are not optional: a binary query returns the binaries and

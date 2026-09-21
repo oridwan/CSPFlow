@@ -224,6 +224,21 @@ class TestRenderScript:
         assert "set -eo pipefail" in text
         assert "set -eu" not in text and "set -u" not in text
 
+    def test_raises_the_stack_limit_before_running_anything(self, orion, tmp_path):
+        """VASP segfaults in EDDAV on this site's 8 MB soft stack limit (D115).
+
+        The hard limit is unlimited, so this needs no privilege -- and the
+        failure it prevents names neither the stack nor the limit, it is just
+        `forrtl: severe (174): SIGSEGV` partway into the first SCF.
+        """
+        text = SlurmScheduler(orion).render_script(self._spec(tmp_path))
+        assert "ulimit -s unlimited" in text
+        # Before the payload, or it protects nothing.
+        assert text.index("ulimit -s unlimited") < text.index("srun vasp_std")
+        # `|| true` so a site whose hard limit forbids it does not die under
+        # `set -e` on the very line meant to make it more robust.
+        assert "ulimit -s unlimited || true" in text
+
     def test_array_carries_the_throttle(self, orion, tmp_path):
         spec = self._spec(tmp_path, array_size=500, array_throttle=48)
         text = SlurmScheduler(orion).render_script(spec)
@@ -469,3 +484,150 @@ class TestArrayAggregation:
         monkeypatch.setattr(sched, "_squeue", lambda ids: {})
         monkeypatch.setattr(sched, "_sacct", lambda ids: {})
         assert sched.poll(["99"])["99"].state is JobState.unknown
+
+
+def test_partition_constraint_reaches_the_sbatch_header():
+    """A partition constraint must be emitted, or heterogeneous pools bite.
+
+    The Orion CPU pool mixes AVX-512 hardware (Cascade Lake, Genoa, Turin) with
+    hardware that has none (EPYC Rome, Milan, Broadwell), and `vasp_std` here is
+    built with 5,285 AVX-512 instructions.  On a Rome node it dies instantly
+    with `forrtl: severe (168): illegal instruction`, before writing an OUTCAR --
+    so the campaign records `relax: no OUTCAR` and there is nothing else to
+    diagnose from.  Measured 2026-09-09: 21 of 21 failures on Rome, 0 elsewhere.
+
+    The plumbing existed; the profile simply did not set it.  This asserts the
+    value survives from the machine profile to the job script.
+    """
+    from pathlib import Path
+
+    from cspflow.config.schema import Machine
+    from cspflow.scheduler.base import JobSpec
+    from cspflow.scheduler.slurm import SlurmScheduler
+
+    machine = Machine(**{
+        "scheduler": "slurm",
+        "partitions": {"cpu": {"name": "Orion,Apus",
+                               "constraint": "caslake|genoa",
+                               "exclude": "str-c92"}},
+        "defaults": {"nodes": 1, "ntasks": 4, "mem": "8G"},
+    })
+    spec = JobSpec(name="probe", stage="dft", workdir=Path("/tmp"),
+                   command="echo hi", role="cpu")
+    header = [l for l in SlurmScheduler(machine).render_script(spec).splitlines()
+              if l.startswith("#SBATCH")]
+
+    assert "#SBATCH --constraint=caslake|genoa" in header
+    assert "#SBATCH --exclude=str-c92" in header
+
+
+def test_the_shipped_orion_profile_excludes_non_avx512_hardware():
+    """The shipped profile must keep the constraint: removing it is silent.
+
+    Nothing fails at submit time, at doctor time, or in the log -- the jobs are
+    simply lost, one per node landing, with `no OUTCAR` as the only symptom.
+    """
+    import yaml
+
+    import cspflow
+    from cspflow.config.schema import Machine
+
+    path = Path(cspflow.__file__).parent / "machines" / "orion.yaml"
+    machine = Machine(**yaml.safe_load(path.read_text()))
+    constraint = machine.partitions["cpu"].constraint or ""
+
+    assert constraint, "orion.yaml cpu partition lost its AVX-512 constraint"
+    # Every feature below was checked with a live `lscpu` probe job, one per
+    # architecture, on 2026-09-09.  `skylake` is Nebula's Xeon Gold 6154:
+    # Skylake-SP does carry AVX-512, so leaving it out would silently exclude a
+    # whole partition that works.
+    for feature in ("caslake", "genoa", "turin", "skylake"):
+        assert feature in constraint, f"{feature} has AVX-512 and should be allowed"
+    for bad in ("rome", "milan", "broadwell"):
+        assert bad not in constraint, f"{bad} has no AVX-512 and must not be allowed"
+
+
+# --------------------------------------------------------------------------
+# The cause of death lives on the STEP, not the allocation
+# --------------------------------------------------------------------------
+
+
+class TestStepCausePromotion:
+    """`sacct -X` asks for allocation rows only, so `.batch` and `.extern` do
+    not masquerade as the job. The cost was that it also hid the step that
+    actually died -- and SLURM records the cause there:
+
+        26930826_0         dft-18-static   FAILED          1:0
+        26930826_0.batch   batch           FAILED          1:0
+        26930826_0.0       vasp_std        OUT_OF_MEMORY   0:125
+
+    `_rule_for` matched retry rules against `FAILED`, so the `out_of_memory`
+    rung the magnets recipe has always carried never fired. CeFeB sids 18, 50
+    and 52 dead-ended that way on 2026-09-12 -- killed after five seconds on
+    three different nodes, with a `resources: {mem: 64G}` remedy unused.
+    """
+
+    @staticmethod
+    def _scheduler(monkeypatch, orion, alloc_rows, step_rows):
+        from cspflow.scheduler.slurm import SlurmScheduler
+
+        sched = SlurmScheduler(orion)
+        calls = []
+
+        class Result:
+            def __init__(self, stdout):
+                self.stdout = stdout
+                self.returncode = 0
+                self.stderr = ""
+
+        def fake_run(cmd, check=False, **kw):
+            calls.append(cmd)
+            return Result(step_rows if "-X" not in cmd else alloc_rows)
+
+        monkeypatch.setattr(sched, "_run", fake_run)
+        return sched, calls
+
+    def test_an_oom_step_corrects_the_jobs_reason(self, monkeypatch, orion):
+        sched, calls = self._scheduler(
+            monkeypatch, orion,
+            alloc_rows="26930826_0|FAILED|1:0|00:00:08|64|None\n",
+            step_rows=("26930826_0|FAILED|\n"
+                       "26930826_0.batch|FAILED|\n"
+                       "26930826_0.0|OUT_OF_MEMORY|\n"),
+        )
+        out = sched._sacct(["26930826_0"])
+        assert out["26930826_0"].raw_state.startswith("OUT_OF_MEMORY")
+        assert len(calls) == 2                    # one extra query, only on failure
+
+    def test_a_clean_job_costs_no_extra_query(self, monkeypatch, orion):
+        """The second sacct must not run for every poll of a healthy campaign."""
+        sched, calls = self._scheduler(
+            monkeypatch, orion,
+            alloc_rows="1_0|COMPLETED|0:0|00:10:00|64|None\n",
+            step_rows="",
+        )
+        sched._sacct(["1_0"])
+        assert len(calls) == 1
+
+    def test_a_failure_with_no_oom_step_is_left_alone(self, monkeypatch, orion):
+        """Not every failure is an OOM, and mislabelling one would fire the
+        wrong rung -- a bigger --mem does not fix `command not found`."""
+        sched, _ = self._scheduler(
+            monkeypatch, orion,
+            alloc_rows="7_0|FAILED|127:0|00:00:01|64|None\n",
+            step_rows="7_0|FAILED|\n7_0.batch|FAILED|\n",
+        )
+        out = sched._sacct(["7_0"])
+        assert out["7_0"].raw_state == "FAILED"
+
+    def test_the_allocation_row_still_wins_for_identity(self, monkeypatch, orion):
+        """Only the reason is corrected; the job keeps its own id and state."""
+        sched, _ = self._scheduler(
+            monkeypatch, orion,
+            alloc_rows="9_2|FAILED|1:0|00:00:05|64|None\n",
+            step_rows="9_2|FAILED|\n9_2.0|OUT_OF_MEMORY|\n",
+        )
+        out = sched._sacct(["9_2"])
+        assert set(out) == {"9_2"}
+        assert out["9_2"].job_id == "9_2"
+        assert out["9_2"].alloc_cpus == 64

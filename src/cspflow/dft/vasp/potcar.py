@@ -59,15 +59,29 @@ class PotcarInfo:
         return self.md5_header_hash[:8]
 
 
+# La is 4f0: there is no 4f shell to freeze, so VASP ships no `La_3` and never
+# will.  The bare `La` dataset IS the frozen-f convention for lanthanum -- it has
+# no f valence electrons to begin with -- so it satisfies
+# `assert_one_f_convention` alongside Sm_3 and Gd_3 rather than violating it.
+# Verified against the local PBE_64 tree 2026-09-01: La, La_GW and La_s exist;
+# La_3 does not.  Every other element of the series has its `_3` variant.
+NO_FROZEN_VARIANT = {"La": "La"}
+
+
 def rare_earth_symbol(element: str, treatment: FTreatment) -> str:
     """Apply the campaign's 4f convention to one rare earth.
 
-    ``frozen`` gives ``<El>_3`` across the whole series, Gd/Eu/Ce included --
+    ``frozen`` gives ``<El>_3`` across the series, Gd/Eu/Ce included --
     deliberately diverging from MP, which mixes conventions.  ``valence`` gives
     the bare symbol, with f electrons in the valence.
+
+    La is the one element where the two coincide, because it has no 4f
+    electrons.  Without this it resolves to a `La_3` that does not exist, and
+    the campaign fails at the first La structure rather than at configuration
+    time.
     """
     if treatment is FTreatment.frozen:
-        return f"{element}_3"
+        return NO_FROZEN_VARIANT.get(element, f"{element}_3")
     return element
 
 
@@ -194,6 +208,14 @@ def f_in_valence(element: str, symbol: str, zval: float) -> bool:
     tell the two conventions apart; ZVAL can.
     """
     if element not in RARE_EARTHS:
+        return False
+    if element in NO_FROZEN_VARIANT:
+        # La is 4f0.  The suffix heuristic reads bare `La` as f-in-valence and
+        # is wrong here, because there are no f electrons to put in the
+        # valence: ZVAL 11 (5s2 5p6 5d1 6s2) sits in the frozen-core range,
+        # while every genuine f-in-valence dataset is 14-20.  Left uncorrected,
+        # a La campaign trips `assert_one_f_convention` against its own
+        # correctly-frozen Sm_3 and Gd_3.
         return False
     suffixed = bool(re.search(r"_\d+$", symbol))
     inferred = not suffixed

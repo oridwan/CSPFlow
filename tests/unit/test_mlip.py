@@ -73,6 +73,17 @@ class TestValidateStructure:
         atoms.set_cell([80.0, 80.0, 80.0], scale_atoms=True)
         assert "lattice parameter" in validate_structure(atoms)
 
+    def test_the_length_cap_can_be_raised_for_a_known_good_source(self):
+        """The 50 A default catches a generated cell with a 200 A axis. Applied
+        to a Materials Project phase it also rejects real long-period stacking
+        polytypes -- Cu27Se20 (mp-684606) is genuinely c = 65 A -- so the store
+        raises it. See `MatterSimEngine(max_lattice=...)`.
+        """
+        atoms = bulk("Fe", "bcc", a=2.87, cubic=True)
+        atoms.set_cell([2.87, 2.87, 65.0], scale_atoms=False)
+        assert "lattice parameter" in validate_structure(atoms)
+        assert validate_structure(atoms, max_lattice=120.0) == ""
+
     def test_overlapping_atoms_are_rejected(self):
         """An MLIP does not refuse this; it returns an energy for it."""
         atoms = bulk("Fe", "bcc", a=2.87, cubic=True)
@@ -189,7 +200,7 @@ class TestScreenStage:
         stage = self._stage(cfg)
         items = stage.claim(seeded, budget=10)
         spec = stage.build(items, tmp_path / "screen")
-        manifest = json.loads(next((tmp_path / "screen").glob("*.manifest.json")).read_text())
+        manifest = json.loads(next((tmp_path / "screen").rglob("inputs.json")).read_text())
         assert manifest["chunks"] == [i.structure_ids for i in items]
         assert "--manifest" in spec.command and spec.array_size == 2
 
@@ -207,7 +218,11 @@ class TestScreenStage:
         stage.build(items, workdir)
 
         item = items[0]
-        (workdir / f"{item.key}.task0.json").write_text(json.dumps({
+        # `build` stamped the batch tag onto every item; the results file goes
+        # in that batch's directory (D136), which is where reconcile looks.
+        results = workdir / "batches" / item.group_key / "results-task0.json"
+        results.parent.mkdir(parents=True, exist_ok=True)
+        results.write_text(json.dumps({
             "max_steps": 20,
             "results": [
                 {"structure_id": item.structure_ids[0], "energy": -16.9,
@@ -371,7 +386,7 @@ class TestSeedsThatMustNotMove:
         stage = _screen(cfg)
         items = stage.claim(empty_store, budget=1)
         stage.build(items, tmp_path)
-        manifest = json.loads(next(tmp_path.glob("*.manifest.json")).read_text())
+        manifest = json.loads(next(tmp_path.rglob("inputs.json")).read_text())
         assert manifest["single_point"] == [fixed]
 
     def test_a_normal_structure_is_not_flagged(self, cfg, empty_store):
@@ -390,3 +405,63 @@ class TestSeedsThatMustNotMove:
             {"structure_id": sid, "e_per_atom": -8.0, "converged": True,
              "n_steps": 0, "relaxed": False, "energy": -16.0}]})
         assert empty_store.get_structure(sid).key_value_pairs["mlip_relaxed"] is False
+
+
+# --------------------------------------------------------------------------
+# Admission: a bad SETTING is not a bad structure
+# --------------------------------------------------------------------------
+
+
+class TestAdmission:
+    """`_admit` Niggli-reduces before validating.
+
+    Four Materials Project phases in the reference store were silently dropped
+    from the MatterSim half because their cells arrive in a badly skewed
+    setting: mp-673643 (Ce17O32) has axes of 66/41/10 A at angles 18/19/5
+    degrees.  Reduced, it is 8.7/8.7/10.3 A at 105/95/107 -- same atoms, same
+    volume, same energy -- and it passes.  Those four blocked the MatterSim hull
+    in five chemical systems until 2026-09-12.
+    """
+
+    @staticmethod
+    def _engine(**kw):
+        from cspflow.mlip.mattersim_engine import MatterSimEngine
+
+        return MatterSimEngine(**kw)
+
+    def test_a_skewed_setting_is_reduced_and_admitted(self):
+        import numpy as np
+
+        atoms = bulk("Fe", "bcc", a=2.87, cubic=True)
+        # A basis change: same lattice, expressed with a near-parallel vector.
+        cell = np.array(atoms.cell)
+        cell[0] = cell[0] + 12 * cell[2]
+        atoms.set_cell(cell, scale_atoms=False)
+        assert validate_structure(atoms) != ""          # rejected as it stands
+
+        used, reason = self._engine()._admit(atoms)
+        assert reason == ""
+        assert used.get_volume() == pytest.approx(atoms.get_volume(), rel=1e-9)
+        assert max(used.cell.lengths()) < max(atoms.cell.lengths())
+
+    def test_reduction_preserves_the_atom_count_and_volume(self):
+        atoms = bulk("Fe", "bcc", a=2.87, cubic=True)
+        used, reason = self._engine()._admit(atoms)
+        assert reason == ""
+        assert len(used) == len(atoms)
+        assert used.get_volume() == pytest.approx(atoms.get_volume(), rel=1e-9)
+
+    def test_a_genuinely_bad_cell_is_still_rejected(self):
+        """Reduction must not become a way in for nonsense: overlapping atoms
+        survive any change of basis, so the rejection survives too."""
+        atoms = bulk("Fe", "bcc", a=2.87, cubic=True)
+        atoms.positions[1] = atoms.positions[0] + [0.1, 0.0, 0.0]
+        used, reason = self._engine()._admit(atoms)
+        assert "A apart" in reason
+
+    def test_the_original_cells_reason_is_reported_not_the_reduced_ones(self):
+        """The caller handed us the original; that is the cell to debug."""
+        atoms = bulk("Fe", "bcc", a=2.87, cubic=True)
+        atoms.set_cell([0.4, 0.4, 0.4], scale_atoms=True)
+        _, reason = self._engine()._admit(atoms)
+        assert "lattice parameter" in reason

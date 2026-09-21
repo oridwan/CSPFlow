@@ -158,8 +158,23 @@ class Throttle:
     binding: str
 
     def render(self) -> str:
-        return (f"{self.in_flight} submitted, {self.concurrent_tasks} running at once "
-                f"(bound by {self.binding})")
+        """These are LIMITS, and the wording has to say so.
+
+        This string is appended to a stage line that already carries real
+        counts, and it used to read
+
+            generate  claimed 1  submitted 1  8 submitted, 8 running at once ...
+
+        where "submitted" appears twice meaning two different things: one job
+        actually went out, and the campaign MAY have up to eight. It was read as
+        "eight GPU jobs were launched for three structures", which is the
+        reasonable reading of that sentence and not what happened.
+
+        `may` is doing the work here. A number in a log line is assumed to be a
+        measurement unless something marks it otherwise.
+        """
+        return (f"may submit {self.in_flight} more, {self.concurrent_tasks} "
+                f"may run at once (limit: {self.binding})")
 
 
 def compute_throttle(
@@ -170,6 +185,8 @@ def compute_throttle(
     gpus_per_job: int = 0,
     limits: Limits | None = None,
     already_in_flight: int = 0,
+    max_cores: int | None = None,
+    cores_in_flight: int = 0,
 ) -> Throttle:
     """Reconcile what the config asks for with what the QOS permits.
 
@@ -185,6 +202,24 @@ def compute_throttle(
     """
     limits = limits or Limits()
     binding = "config"
+
+    # A CORE cap, counting this campaign's own queued AND running jobs (D142).
+    #
+    # `max_in_flight` counts JOBS, which is not the quantity anyone is trying to
+    # protect. With this recipe's 64 ranks, `max_in_flight: 48` is 3,072 cores --
+    # and no QOS on this cluster's `cpu` role caps it, so the campaign would take
+    # everything and leave the user unable to run anything else.
+    #
+    # Queued counts, not just running: work already in the queue WILL occupy
+    # those cores, and a cap that ignores it approves a submission the queue has
+    # already spent.
+    cores_ceiling: int | None = None
+    cores_reason = ""
+    if max_cores is not None and ntasks > 0:
+        room = max(0, int(max_cores) - int(cores_in_flight))
+        cores_ceiling = room // ntasks
+        cores_reason = (f"max_cores={max_cores}, {cores_in_flight} held "
+                        f"-> room for {cores_ceiling} more at {ntasks} ranks")
 
     # `max_in_flight` means "this many out at once", so work already queued
     # comes out of it whether or not the site publishes a cap. Subtracting only
@@ -209,6 +244,15 @@ def compute_throttle(
         if cap < concurrent:
             concurrent = cap
             binding = f"QOS gpu={limits.max_gpus} at {gpus_per_job} per job"
+
+    if cores_ceiling is not None:
+        # Whichever limit is lower is the one to name. Reporting the job count
+        # while the core cap is what actually stopped submission sends the
+        # reader to change a number that is not binding.
+        if cores_ceiling < in_flight:
+            binding = cores_reason
+        in_flight = min(in_flight, cores_ceiling)
+        concurrent = min(concurrent, cores_ceiling)
 
     # Running more at once than are submitted is meaningless.
     concurrent = min(concurrent, in_flight) if in_flight else concurrent
@@ -235,6 +279,7 @@ class Scheduler(Protocol):
 
     def submit(self, spec: JobSpec) -> str: ...
     def poll(self, job_ids: list[str]) -> dict[str, JobStatus]: ...
+    def poll_tasks(self, job_ids: list[str]) -> dict[str, JobStatus]: ...
     def cancel(self, job_ids: list[str]) -> None: ...
     def limits(self, role: str) -> Limits: ...
     def in_flight(self) -> int: ...

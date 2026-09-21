@@ -56,23 +56,42 @@ THERMO_GGA = "GGA_GGA+U"
 THERMO_MIXED = "GGA_GGA+U_R2SCAN"
 THERMO_R2SCAN = "R2SCAN"
 
-CACHE_ENV = "CSPFLOW_CACHE"
-DEFAULT_CACHE = Path.home() / ".cache" / "cspflow" / "reference"
+# Deliberately NOT under ~/.cache.  On every convention that defines it --
+# XDG's, and the plain English one -- a cache is data that may be deleted at any
+# time and regenerated on demand.  Half of what lives here cannot: the MP
+# download is regenerable, but our own DFT energies for the same phases cost
+# thousands of core-hours and no amount of network access brings them back.  A
+# directory named "cache" invites exactly the cleanup that would destroy them.
+#
+# `$CSPFLOW_REFERENCE` overrides.  `$CSPFLOW_CACHE` is still honoured so an
+# existing setup does not silently start writing somewhere else.
+REFERENCE_ENV = "CSPFLOW_REFERENCE"
+LEGACY_ENV = "CSPFLOW_CACHE"
+DEFAULT_REFERENCE = Path.home() / ".local" / "share" / "cspflow" / "reference"
 
 
 class ReferenceError(Exception):
     pass
 
 
-def cache_root() -> Path:
+def reference_root() -> Path:
     """Where reference data lives -- deliberately OUTSIDE any campaign.
 
     A `structure_list` campaign and a `chemical_space` campaign that both touch
-    Sm-Fe-Ti should pay for that reference hull once, not once each. Keyed on
+    Sm-Fe-Ti should pay for that reference set once, not once each. Keyed on
     chemsys + thermo_type + scale, which is the whole of what determines the
     numbers.
     """
-    return Path(os.environ.get(CACHE_ENV, str(DEFAULT_CACHE)))
+    for name in (REFERENCE_ENV, LEGACY_ENV):
+        value = os.environ.get(name)
+        if value:
+            return Path(value)
+    return DEFAULT_REFERENCE
+
+
+# The old name, kept so nothing outside this module breaks on the rename.
+# It was never a cache; see the comment on DEFAULT_REFERENCE.
+cache_root = reference_root
 
 
 def assert_scale_matches_thermo_type(thermo_type: str, energy_scale: str) -> None:
@@ -379,7 +398,7 @@ def _float(value: Any) -> float | None:
 
 
 def _cache_path(chemsys: str, thermo_type: str, cache: Path | None) -> Path:
-    root = cache or cache_root()
+    root = cache or reference_root()
     safe = thermo_type.replace("+", "p").replace("/", "_")
     return root / f"{chemsys}__{safe}.json"
 

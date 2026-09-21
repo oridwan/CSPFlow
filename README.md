@@ -14,9 +14,9 @@ source ──► generate ──► screen ──► dedup ──► reference �
 
 Everything lives in one SQLite file per campaign, so a run can be stopped,
 inspected and resumed at any point. Cheap MLIP screening runs as a barrier;
-expensive DFT runs as a throttled stream under a core-hour budget.
+expensive DFT runs as a throttled stream under a core cap (`dft.max_cores`).
 
-**📖 [User guide](docs/) · [Quick start](docs/quickstart.md) · [Examples](examples/)**
+**📖 [User guide](docs/) · [Quick start](docs/02-quickstart.md) · [Examples](examples/)**
 
 ## Install
 
@@ -28,24 +28,33 @@ csp doctor --fix                 # check the cluster; --fix builds the POTCAR la
 
 Structure generation and MLIP screening need MatterGen and MatterSim, which pin
 each other and pin torch. `./scripts/build_env.sh cspflow` builds one conda
-environment holding all three. Full detail: [Installation](docs/installation.md).
+environment holding all three. Full detail: [Installation](docs/01-installation.md).
 
 ## Run a campaign
 
 A campaign is a **folder**, and every knob you might turn is in it:
 
 ```bash
-csp init my-campaign -m orion
+csp init 1 my-campaign      # 1 chemical_space | 2 composition_list | 3 structure_list
 cd my-campaign
 ```
 
+| type | source mode | the question it answers | you give |
+|---|---|---|---|
+| `1` | `chemical_space` | "search a region of the periodic table" | element groups |
+| `2` | `composition_list` | "I know which formulas I want" | formulas, inline or a CSV |
+| `3` | `structure_list` | "I already have the structures" | POSCAR/CIF files |
+
+The folder is a copy of [the example for that type](examples/). `csp init my-campaign`
+without a type prints this menu and asks.
+
 ```
 my-campaign/
-├── campaign.yaml   what to search, and how hard   ← every tunable key, listed
+├── campaign.yaml   what to search, and how hard   ← every setting live, alternatives beside it
 ├── machine.yaml    partitions, walltime, modules, VASP, POTCAR trees
 ├── recipe.yaml     the DFT ladder: INCAR tags, k-points, per-step resources
-├── inputs/         your own structures or composition lists
-├── results/        → workdir on scratch (symlinked on the first run)
+├── inputs/         your own structures or composition lists (types 2, 3: demo copies)
+├── results/        everything the campaign produces
 └── report/         report.html + candidates.csv
 ```
 
@@ -54,8 +63,8 @@ $EDITOR campaign.yaml                   # elements, cutoffs, how many structures
 csp doctor                              # then fix whatever it flags
 
 csp source --dry-run                    # what would be enumerated, nothing written
-csp run --through calibrate             # Phase A: generate, screen, dedup, calibrate
-csp run --from filter --watch           # Phase B: stream DFT under the budget
+csp run --through reference             # Phase A: generate, screen, dedup, reference
+csp run --from filter --watch           # Phase B: stream DFT under dft.max_cores
 
 csp status                              # progress
 csp status --why 1042                   # the full life history of one structure
@@ -118,52 +127,31 @@ source:
 
 Several sources can run in one campaign — give each a `name` and a seed set
 stays distinguishable from the sweep it is a control for.
-[More →](docs/sources.md)
+[More →](docs/03-sources.md)
 
 ## Documentation
 
+New here? Open the **[numbered user guide](docs/)** and read Guides 01–04 in
+order. The remaining pages are references you can use as the need arises.
+
 | | |
 |---|---|
-| [Installation](docs/installation.md) | Install, the MP key, POTCARs, the ML environment |
-| [Quick start](docs/quickstart.md) | Nothing to `report.html` in ten minutes |
-| [Choosing your input](docs/sources.md) | The three source modes in depth, and the CSV format |
-| [`campaign.yaml` reference](docs/campaign.md) | Every setting, its default, and which ones matter |
-| [Running on your cluster](docs/machines.md) | Partitions, modules, walltime, POTCAR trees, VASP |
-| [The DFT recipe](docs/recipes.md) | INCAR tags, k-points, resources, the retry ladder |
-| [The stages](docs/stages.md) | What each stage does, and why the run has two phases |
-| [Reading the results](docs/results.md) | `report.html`, `candidates.csv`, the database |
-| [Command reference](docs/cli.md) | Every `csp` command and option |
-| [Troubleshooting](docs/troubleshooting.md) | The errors you will actually hit |
+| [01 — Installation](docs/01-installation.md) | Install, the MP key, POTCARs, the ML environment |
+| [02 — Quick start](docs/02-quickstart.md) | Create and safely check a small first campaign |
+| [03 — Choosing your input](docs/03-sources.md) | The three source modes in depth, and the CSV format |
+| [04 — A-to-Z workflows](docs/04-workflows.md) | A complete run for each source mode |
+| [05 — `campaign.yaml` explained](docs/05-campaign.md) | The main file, block by block |
+| [06 — Every campaign setting](docs/06-settings.md) | Exact keys, defaults, and common mistakes |
+| [07 — Pipeline stages](docs/07-stages.md) | What each stage does, and why the run has two phases |
+| [08 — Running on your cluster](docs/08-machines.md) | Partitions, modules, walltime, POTCAR trees, VASP |
+| [09 — The DFT recipe](docs/09-recipes.md) | INCAR tags, k-points, resources, the retry ladder |
+| [10 — The reference set](docs/10-reference-set.md) | The shared one-scale DFT data behind convex hulls |
+| [11 — Reading the results](docs/11-results.md) | `report.html`, `candidates.csv`, the database |
+| [12 — Command reference](docs/12-cli.md) | Every `csp` command and option |
+| [13 — Troubleshooting](docs/13-troubleshooting.md) | The errors you will actually hit |
 | [`examples/`](examples/) | Three complete campaigns with sample inputs |
 
-## Design principles
 
-Three, and they explain most of what looks unusual:
-
-**Nothing implicit.** No `MPRelaxSet`, no library defaults left to inherit. A
-recipe that omits `ENCUT` is refused, because VASP would use `max(ENMAX)` over
-the POTCARs — which *changes with composition*, so a hull built on it compares
-incomparable numbers. `csp recipe` prints every tag literal.
-
-**Stop rather than guess.** An undefined `$VAR`, a typo'd key, an ambiguous
-formula, a POSCAR two parsers disagree about: all hard errors. Each is a case
-where continuing produces a wrong number that looks exactly like a right one.
-
-**Prove the cheap number before spending on the expensive one.** `calibrate`
-runs your own DFT on a sample and checks that the MLIP ranks structures the way
-it does. By default it *blocks* Phase B if it does not.
-
-## Status
-
-M0–M4 complete: all nine stages implemented, the unit suite green, and one
-end-to-end run on a live cluster.
-
-**One gate is open before a new campaign's DFT hull can be trusted.**
-`reference.mode` defaults to `recompute` and is wired to nothing, so a DFT hull
-places candidates against Materials Project reference energies — two absolute
-scales, measured **~0.19 eV/atom** apart in Fe-Sm-Ti against a **0.06 eV/atom**
-selection threshold. `analyze` warns when a hull mixes scales, and Phase A gates
-on the MLIP hull, which is unaffected.
 
 ## License
 

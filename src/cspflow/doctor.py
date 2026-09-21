@@ -19,6 +19,7 @@ from typing import Literal
 
 from .config.loader import ResolvedConfig
 from .config.schema import RARE_EARTHS, Machine
+from .db.store import Store, _filesystem_type, journal_mode_for, wal_lag
 from .dft.vasp import potcar as pc
 
 Status = Literal["ok", "warn", "fail", "fixed", "skip"]
@@ -76,8 +77,8 @@ def check_potcar_layout(machine: Machine, *, fix: bool = False) -> Check:
     VASP 6.4 potentials.
     """
     sources = {
-        "PBE_64": "/projects/mmi/Ridwan/potcarFiles/VASP6.4/potpaw_PBE",
-        "PBE_52": "/projects/mmi/Ridwan/potcarFiles/VASP5.2/potpaw_PBE",
+        "PBE_64": "/projects/mmi/cspflow-shared/potcars/VASP6.4/potpaw_PBE",
+        "PBE_52": "/projects/mmi/cspflow-shared/potcars/VASP5.2/potpaw_PBE",
     }
     sources = {k: v for k, v in sources.items() if k in machine.potcar_dirs}
     if not sources:
@@ -381,9 +382,22 @@ def check_throttle(cfg: ResolvedConfig) -> Check:
     # gres cap and are reported so the ceiling is visible, not because the user
     # chose a number that could be wrong.
     dft_cfg = cfg.campaign.dft
+
+    # The RECIPE's rank count, not the machine default. DFT resources live per
+    # recipe step, so the machine default (16 here) was reported while the
+    # recipe asks for 64 -- and every core number derived from it was wrong by
+    # 4x. Same fault as D135 fixed in the driver; this copy was missed.
+    ntasks = machine.defaults.ntasks
+    try:
+        from .stages.dft_stage import DftStage
+
+        ntasks = int(DftStage(cfg).resource_hint()[0]) or ntasks
+    except Exception:                                   # noqa: BLE001
+        pass
+
     plans = [
         ("dft", "cpu", dft_cfg.max_in_flight, dft_cfg.max_concurrent_tasks,
-         machine.defaults.ntasks, 0),
+         ntasks, 0),
     ]
     for stage, res in (("generate", cfg.campaign.generate.resources if cfg.campaign.generate else None),
                        ("screen", cfg.campaign.screen.resources)):
@@ -403,12 +417,17 @@ def check_throttle(cfg: ResolvedConfig) -> Check:
         throttle = compute_throttle(
             requested_in_flight=want_flight, requested_concurrent=want_concurrent,
             ntasks=ntasks, gpus_per_job=gpus, limits=limits,
+            # Only the CPU/DFT plan is core-capped; the GPU stages are bound by
+            # the gres cap. Reporting a cap that does not apply would be as
+            # misleading as omitting one that does.
+            max_cores=dft_cfg.max_cores if stage == "dft" else None,
         )
         clamped = (throttle.in_flight < want_flight
                    or throttle.concurrent_tasks < want_concurrent)
+        cores = f"  = {throttle.in_flight * ntasks} cores" if stage == "dft" else ""
         rows.append(
-            f"{stage:<8} role={role:<4} asked {want_flight}/{want_concurrent}  "
-            f"-> {throttle.render()}"
+            f"{stage:<8} role={role:<4} asked {want_flight}/{want_concurrent} "
+            f"at {ntasks} ranks  -> {throttle.render()}{cores}"
         )
         if limits.source == "live":
             rows.append(f"         (no QOS found for role {role!r}; limits unknown)")
@@ -490,7 +509,7 @@ def check_generator(cfg: ResolvedConfig, *, fix: bool = False) -> Check:
 
 def check_paths(cfg: ResolvedConfig) -> Check:
     rows, worst = [], "ok"
-    workdir = Path(cfg.campaign.workdir)
+    workdir = cfg.work_dir
     parent = workdir if workdir.exists() else workdir.parent
     if not parent.exists():
         rows.append(f"workdir {workdir} -- parent {parent} does not exist")
@@ -513,11 +532,206 @@ def check_paths(cfg: ResolvedConfig) -> Check:
 # --------------------------------------------------------------------------
 
 
+def check_reference_recipe(cfg: ResolvedConfig) -> Check:
+    """Is this campaign's DFT policy the same one the store's energies used?
+
+    This is still the one rule that cannot be relaxed (D101): every energy on
+    one hull must come from identical settings. Ours minus MP is +0.15 to
+    +0.21 eV/atom while the selection threshold is 0.06, so a hull mixing two
+    scales still builds, still looks reasonable, and ranks every compound
+    wrongly.
+
+    What changed on 2026-09-11 is the CONSEQUENCE of a mismatch, so the old
+    message here was misleading. Reference energies are no longer looked up in
+    a `computed/<recipe_id>/` cache -- they are read from the store folder
+    (`reference/refstore.py`), so a mismatched campaign no longer reads an
+    EMPTY reference set. It reads a FULL one computed under different settings,
+    which is worse: a plausible hull on a mixed scale.
+
+    The authority is the store's OWN settings.yaml -- the file that actually
+    computed the energies -- not a copy beside the reference cache. Those two
+    had drifted: the copy was two hours stale and missing five magnetism-table
+    entries, which is what made this check fire on a campaign that had lifted
+    the store's policy verbatim.
+    """
+    import os
+
+    from .cli import store_settings_path
+
+    # the store's own settings.yaml first: it is what computed the energies
+    candidates = []
+    env = os.environ.get("CSPFLOW_STORE")
+    if env:
+        candidates.append(Path(env) / "settings.yaml")
+    fallback = store_settings_path()
+    if fallback is not None:
+        candidates.append(fallback)
+    store = next((c for c in candidates if c and Path(c).is_file()), None)
+    if store is None:
+        return Check("reference recipe", "skip",
+                     "no store settings.yaml found ($CSPFLOW_STORE unset?)")
+    try:
+        from .cli import _dft_and_recipe
+        from .dft.recipe import load_recipe
+        from .reference.computed import recipe_id
+
+        mine = recipe_id(cfg.campaign.dft, load_recipe(cfg.campaign.dft.recipe, cfg.base_dir))
+        s_dft, s_recipe, _ = _dft_and_recipe(Path(store), None)
+        theirs = recipe_id(s_dft, s_recipe)
+    except Exception as exc:                                  # noqa: BLE001
+        return Check("reference recipe", "skip", f"could not compare: {exc}")
+
+    if mine == theirs:
+        return Check("reference recipe", "ok",
+                     f"matches the store ({mine[:16]}) -- the hull is on one scale",
+                     [f"store  {store}"])
+    return Check(
+        "reference recipe", "warn",
+        f"campaign {mine[:16]} != store {theirs[:16]}: candidate and reference "
+        f"energies would land on DIFFERENT scales",
+        [f"store   {store}",
+         "effect  the hull still builds and looks correct, and ranks wrongly (D101)",
+         "fix     copy the store's `dft:` block into campaign.yaml verbatim"])
+
+
+
+
+# Elements whose 3d shell carries a moment our DFT actually computes.  The 4f
+# moment is NOT in the calculation when `f_treatment: frozen` -- the rare earth
+# runs on its `_3` POTCAR with the f electrons in the core -- so a cell whose
+# only magnetic species is a rare earth has no computed moment at all.
+MAGNETIC_3D = {"Fe", "Co", "Ni", "Mn", "Cr"}
+
+
+def check_magnetism_is_computed(cfg: ResolvedConfig,
+                                elements: list[str] | None) -> Check:
+    """If the moment is the target property, is it being computed or assumed?
+
+    `rare_earth.f_treatment: frozen` puts the 4f electrons in the POTCAR core.
+    That is the right choice for ENERGIES -- it gives one convention across the
+    series, which MP does not have (D109) -- but it means VASP never computes a
+    4f moment.  `reconstruct_ms: true` adds a nominal spin-only value back at
+    reporting time, which is a bookkeeping constant per rare-earth atom, not a
+    measurement.
+
+    So in a cell whose only magnetic species is the rare earth, the reported
+    moment is entirely reconstructed and varies only with how many rare-earth
+    atoms the cell holds.  Ranking such candidates by moment ranks them by
+    composition.
+
+    Measured in the store on 443 Ce phases run at exactly these settings:
+
+        Ce with an Fe/Co/Ni/Mn/Cr partner   median 0.001, 90th pct 1.17 uB/atom
+        Ce with no magnetic 3d              87% below 0.05 uB/atom
+
+    The second row is the trap.  (ISPIN=2 was confirmed on 357 of 358 sampled
+    static runs, so those zeros are the physics, not a missing tag.)
+    """
+    rare_earth = getattr(cfg.campaign.dft, "rare_earth", None)
+    treatment = getattr(getattr(rare_earth, "f_treatment", None), "value", None)
+    if treatment != "frozen":
+        return Check("magnetism", "ok",
+                     f"f_treatment={treatment or 'unset'} -- the 4f moment is in "
+                     f"the calculation")
+
+    if not elements:
+        return Check("magnetism", "skip",
+                     "no elements yet -- run `csp source` first, or pass --elements")
+
+    present = set(elements)
+    computed = sorted(present & MAGNETIC_3D)
+    rares = sorted(e for e in present if e in RARE_EARTHS)
+    if computed:
+        return Check(
+            "magnetism", "ok",
+            f"f_treatment=frozen; the computed moment lives on {', '.join(computed)}",
+            rows=[f"the {', '.join(rares)} 4f moment is reconstructed, not computed "
+                  f"-- report m_dft_raw and m_s_reconstructed separately"] if rares else [])
+
+    if not rares:
+        return Check("magnetism", "ok", "no magnetic species in this campaign")
+
+    return Check(
+        "magnetism", "warn",
+        f"f_treatment=frozen and the only magnetic species is {', '.join(rares)}",
+        rows=[
+            "VASP computes NO 4f moment here: the f electrons are in the POTCAR",
+            "core. Every reported moment is reconstruct_ms bookkeeping, a",
+            f"constant per {rares[0]} atom -- so ranking these candidates by",
+            "moment ranks them by composition, not by physics.",
+            "Measured on 246 store phases at these settings: 87% come out below",
+            "0.05 uB/atom, median exactly 0.000.",
+            "If the moment is the target property, set",
+            "  dft.rare_earth.f_treatment: valence   (+ LDAU on the 4f)",
+            "which is a DIFFERENT DFT policy: its own store, its own hull.",
+        ])
+
+def check_database_readability(cfg: ResolvedConfig) -> Check:
+    """Can this node read this campaign's database, and is what it reads current?
+
+    Both halves matter and only the first is obvious. A campaign database on a
+    network filesystem must not be in WAL mode: the `-shm` index that makes a
+    WAL readable is coherent only within one host, so a second node reads the
+    main file as of the last checkpoint. That read succeeds. It simply answers
+    with an old campaign, which is the failure mode you cannot see.
+
+    An existing campaign cannot be converted while its driver holds the file --
+    SQLite declines the mode change, and before `_set_journal_mode` it declined
+    it in silence. So this reports rather than fixes, and names the one moment
+    the conversion is possible.
+    """
+    db = cfg.campaign_db
+    if not db.is_file():
+        return Check("campaign database", "skip", f"none yet at {db}")
+
+    fs = _filesystem_type(db)
+    want = journal_mode_for(db)
+    rows, worst = [], "ok"
+
+    store = Store(db)
+    try:
+        _ = store.sql
+        got = store.journal_mode or "unknown"
+    except Exception as exc:                                   # noqa: BLE001
+        return Check("campaign database", "fail", f"{db} will not open here: {exc}")
+    finally:
+        try:
+            store.close()
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    if got.upper() != want.upper():
+        worst = "fail"
+        rows.append(
+            f"journal mode is {got.upper()} on {fs or 'this filesystem'}, which needs "
+            f"{want}. A WAL on a network filesystem is not readable from another "
+            f"node and is how this database gets corrupted."
+        )
+        rows.append(
+            "SQLite will not change the mode while another connection holds the "
+            "file, so convert it when no driver is running:"
+        )
+        rows.append(f"    sqlite3 {db} 'PRAGMA journal_mode=TRUNCATE;'")
+    else:
+        rows.append(f"journal mode {got.upper()} on {fs or 'unknown fs'}")
+
+    lag = wal_lag(db)
+    if lag is not None:
+        worst = "fail" if worst == "ok" else worst
+        rows.append(
+            f"this node's copy is {lag / 60:.0f} min behind its write-ahead log, so "
+            f"reads here are stale. `csp status` uses status.json instead."
+        )
+
+    return Check("campaign database", worst, "\n".join(rows))
+
+
 def run(cfg: ResolvedConfig, *, elements: list[str] | None = None, fix: bool = False) -> Report:
     report = Report()
     report.add(Check("config", "ok",
                      f"{cfg.campaign.name}  hash {cfg.short_hash}  machine {cfg.machine_path.name}"))
     report.add(check_paths(cfg))
+    report.add(check_database_readability(cfg))
     report.add(check_potcar_layout(cfg.machine, fix=fix))
     if elements:
         report.add(*check_potcars(cfg, elements))
@@ -532,4 +746,6 @@ def run(cfg: ResolvedConfig, *, elements: list[str] | None = None, fix: bool = F
     report.add(check_throttle(cfg))
     report.add(check_optional_deps(cfg))
     report.add(check_generator(cfg, fix=fix))
+    report.add(check_reference_recipe(cfg))
+    report.add(check_magnetism_is_computed(cfg, elements))
     return report

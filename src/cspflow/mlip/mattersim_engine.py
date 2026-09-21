@@ -87,7 +87,13 @@ class MatterSimEngine:
         device: str | None = None,
         optimizer: str = "FIRE",
         relax_cell: bool = True,
+        max_lattice: float | None = None,
     ) -> None:
+        # `max_lattice` is None for campaign work, where the 50 A default guards
+        # against generated nonsense.  The reference store passes a larger value
+        # because its structures come from MP and a long axis there is a real
+        # long-period polytype, not a defect.  See `_admit`.
+        self.max_lattice = max_lattice
         self.model = model
         self.fmax = fmax
         self.max_steps = max_steps
@@ -125,7 +131,7 @@ class MatterSimEngine:
     # -- work --------------------------------------------------------------
 
     def single_point(self, atoms) -> RelaxResult:
-        reason = validate_structure(atoms)
+        atoms, reason = self._admit(atoms)
         if reason:
             return RelaxResult(error=reason, engine=self.name)
 
@@ -147,8 +153,52 @@ class MatterSimEngine:
             engine=self.name,
         )
 
+    # -- admission ---------------------------------------------------------
+
+    def _admit(self, atoms):
+        """Validate, and if only the CELL SETTING is at fault, reduce it and retry.
+
+        Two different things get rejected by the same gate and only one of them
+        is a real problem:
+
+        * a nonsense cell from a generative model -- reject it, that is the point
+        * a real structure written in a badly skewed setting -- the same atoms,
+          the same volume, the same energy, just an unreduced basis
+
+        Materials Project serves plenty of the second kind.  mp-673643
+        (Ce17O32) arrives with cell angles of 18/19/5 degrees and axes of
+        66/41/10 A; Niggli-reduced it is 8.7/8.7/10.3 A at 105/95/107 degrees --
+        identical volume, and it passes.  Before this, four store phases were
+        dropped from the MatterSim reference for no physical reason, which is
+        what blocked the MatterSim hull in five chemical systems.
+
+        Reduction is applied unconditionally, not only as a rescue.  It is a
+        change of lattice BASIS, not of structure: the atoms, the volume and the
+        energy are identical, and the reduced basis is the canonical one.  Doing
+        it always also keeps a cell like mp-684627 (angles 28/30/14 degrees,
+        which passes the length check but is a poor neighbour list) from
+        reaching the optimizer in that setting.
+
+        Returns (atoms_to_use, reason).  A non-empty reason means genuinely
+        rejected, after reduction was tried.
+        """
+        try:
+            from ase.build import niggli_reduce
+
+            reduced = atoms.copy()
+            niggli_reduce(reduced)
+        except Exception:                                          # noqa: BLE001
+            reduced = None
+
+        if reduced is not None and not validate_structure(
+                reduced, max_lattice=self.max_lattice):
+            return reduced, ""
+        # Reduction did not help (or failed).  Report the ORIGINAL cell's verdict,
+        # because that is the cell the caller handed us and the one to debug.
+        return atoms, validate_structure(atoms, max_lattice=self.max_lattice)
+
     def relax(self, atoms) -> RelaxResult:
-        reason = validate_structure(atoms)
+        atoms, reason = self._admit(atoms)
         if reason:
             return RelaxResult(error=reason, engine=self.name)
 

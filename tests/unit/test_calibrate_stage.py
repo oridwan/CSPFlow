@@ -210,3 +210,109 @@ class TestCalibrateStage:
         engine = FakeEngine(); engine.truth = truth
         stage = CalibrateStage(make_cfg(tmp_path), engine=engine)
         assert stage.run(store).reconciled == 5
+
+
+# -- the 4b default (D119) -------------------------------------------------
+
+class TestPilotIsOffByDefault:
+    """4b used to `block` the expensive tier until a pilot DFT set came back.
+
+    It is now off by default, because the reference set carries both MatterSim
+    and our own DFT for 2,711 phases -- so the MLIP-against-OUR-DFT comparison
+    4b existed to make is available before a campaign starts, on 68x the sample
+    4b's default 40 would have given. These tests pin that default: it is a
+    decision about how much a campaign is trusted to spend unsupervised, and a
+    docstring cannot hold it.
+    """
+
+    @staticmethod
+    def _cfg(tmp_path, extra=""):
+        from cspflow.config.loader import load_campaign
+
+        (tmp_path / "seeds").mkdir(exist_ok=True)
+        path = tmp_path / "campaign.yaml"
+        path.write_text(
+            "name: t\nmachine: local\nworkdir: %s\n"
+            "source:\n  - mode: structure_list\n    name: seeds\n"
+            "    structure_list: {paths: [\"%s/seeds\"]}\n%s"
+            % (tmp_path, tmp_path, extra))
+        return load_campaign(path)
+
+    def test_the_default_is_off(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        assert cfg.campaign.calibrate.pilot.on_fail.value == "off"
+
+    def test_4a_still_warns_by_default(self, tmp_path):
+        """4a is free and stays on: it catches gross failure for no DFT."""
+        cfg = self._cfg(tmp_path)
+        assert cfg.campaign.calibrate.mp.on_fail.value == "warn"
+
+    def test_dft_is_not_gated_by_default(self, tmp_path):
+        """The point of the change: a campaign reaches DFT without first
+        spending 40 jobs to earn permission."""
+        from cspflow.db.store import Store
+        from cspflow.stages.dft_stage import DftStage
+
+        cfg = self._cfg(tmp_path)
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            assert DftStage(cfg)._pilot_gate(store) == ""
+
+    def test_no_pilot_work_is_claimed_by_default(self, tmp_path):
+        """Off at the other end too: 4b must not select a pilot set that
+        nothing will ever judge."""
+        from cspflow.db.store import Store
+        from cspflow.stages.calibrate_stage import CalibrateStage
+
+        cfg = self._cfg(tmp_path)
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            assert CalibrateStage(cfg)._pilot_has_work(store) is False
+
+    def test_it_can_still_be_turned_back_on(self, tmp_path):
+        """Turning it on stays the honest move for a chemistry the reference
+        set does not cover -- so the gate must still work when asked for.
+
+        Screened candidates are needed to see the difference: with nothing to
+        select from, 4b has no work whatever the policy, and the DFT gate stays
+        open on purpose. The barrier exists to stop spending on an unchecked
+        model, not to stop a campaign that has nothing to check it with.
+        """
+        from ase.build import bulk
+
+        from cspflow.db.store import Origin, Store, StructureState
+        from cspflow.stages.calibrate_stage import CalibrateStage
+        from cspflow.stages.dedup_stage import CHECKED_KEY
+        from cspflow.stages.dft_stage import DftStage
+
+        cfg = self._cfg(tmp_path, "calibrate:\n  pilot: {on_fail: block}\n")
+        assert cfg.campaign.calibrate.pilot.on_fail.value == "block"
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            # Deduplicated: `_selectable` returns nothing while anything is
+            # still waiting, so an undeduplicated row would make this test pass
+            # for the wrong reason.
+            store.add_structure(bulk("Fe", "bcc", a=2.87, cubic=True),
+                                origin=Origin.generated,
+                                state=StructureState.screened,
+                                mlip_e_per_atom=-8.0, mlip_converged=True,
+                                **{CHECKED_KEY: True})
+            assert CalibrateStage(cfg)._pilot_has_work(store) is True
+            # and the expensive tier is held until 4b reports
+            assert DftStage(cfg)._pilot_gate(store) == ""   # nothing selected yet
+
+    def test_with_the_default_a_selected_pilot_never_appears(self, tmp_path):
+        """The whole 4b machinery stays dormant, not merely ungated: an
+        unselected pilot cannot hold anything up later."""
+        from ase.build import bulk
+
+        from cspflow.db.store import Origin, Store, StructureState
+        from cspflow.stages.calibrate_stage import CalibrateStage
+        from cspflow.stages.dedup_stage import CHECKED_KEY
+
+        cfg = self._cfg(tmp_path)
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            store.add_structure(bulk("Fe", "bcc", a=2.87, cubic=True),
+                                origin=Origin.generated,
+                                state=StructureState.screened,
+                                mlip_e_per_atom=-8.0, mlip_converged=True,
+                                **{CHECKED_KEY: True})
+            assert CalibrateStage(cfg)._pilot_has_work(store) is False
+            assert CalibrateStage(cfg)._run_pilot(store) == ""

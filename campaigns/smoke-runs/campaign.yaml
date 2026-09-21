@@ -1,0 +1,98 @@
+name: smoke-runs
+machine: orion
+workdir: /scratch/$USER/cspflow/smoke-runs
+archive: null
+source:
+- mode: structure_list
+  name: seeds
+  structure_list:
+    paths:
+    - inputs
+screen:
+  mlip: mattersim
+  mattersim:
+    model: MatterSim-v1.0.0-5M.pth
+    fmax: 0.05
+    max_steps: 1000
+  dedup:
+    matcher:
+      ltol: 0.2
+      stol: 0.2
+      angle_tol: 5.0
+  resources:
+    role: gpu
+    gpus: 1
+    time: 04:00:00
+reference:
+  functionals:
+  - GGA
+  thermo_type: GGA_GGA+U
+  energy_scale: raw
+  mode: recompute
+  prescreen_mode: mp_energies
+  prescreen_hull_max: 0.3
+  snapshot: true
+  relax_with_mlip: true
+calibrate:
+  mp:
+    on_fail: warn
+    thresholds:
+      mae_e_per_atom: 0.05
+      spearman_min: 0.9
+      max_volume_drift: 0.05
+  pilot:
+    on_fail: warn
+    pilot_n: 8
+    thresholds:
+      mae_e_per_atom: 0.05
+      mae_e_hull: 0.05
+      spearman_min: 0.8
+filter:
+  e_above_hull_max: 0.2
+  e_above_hull_max_source: literal
+  max_per_composition: 10
+  spacegroup:
+    min_number: 1
+dft:
+  recipe: recipe.yaml
+  potcar:
+    tree: VASP6.4
+    functional: PBE_64
+    overrides: {}
+  rare_earth:
+    f_treatment: frozen
+    magnetic_order: ferro
+    reconstruct_ms: true
+  magnetism:
+    mode: ferromagnetic
+    strict: true
+    table:
+      As: 0.6
+      Sb: 0.6
+      Bi: 0.6
+      Au: 0.6
+      Ru: 3.0
+      In: 0.6
+      Se: 0.6
+      Te: 0.6
+  ldau:
+    enabled: false
+    ldau_type: 2
+    u: {}
+    j: {}
+  max_in_flight: 3
+  max_concurrent_tasks: 3
+  max_cores: 48                 # 3 jobs x 16 ranks, queued + running
+  select:
+    rank_by: e_above_hull_mlip
+    max_per_composition: 5
+    max_total: 3
+  layout: runs
+  combined_job: true
+analyze:
+  properties:
+  - m_dft_raw
+  - m_s_reconstructed
+  - volume
+  - spacegroup
+  report: html

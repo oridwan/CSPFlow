@@ -109,7 +109,7 @@ def test_potcar_layout_skipped_when_profile_defines_none():
     assert D.check_potcar_layout(Machine()).status == "skip"
 
 
-TREE = Path("/projects/mmi/Ridwan/potcarFiles/pmg")
+TREE = Path("/projects/mmi/cspflow-shared/potcars/pmg")
 has_tree = pytest.mark.skipif(not TREE.is_dir(), reason="POTCAR symlink tree not created")
 
 
@@ -177,37 +177,39 @@ def test_version():
 
 def test_init_writes_a_valid_campaign(tmp_path):
     out = tmp_path / "c.yaml"
-    res = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local"])
+    res = runner.invoke(app, ["init", "1", "demo", "-o", str(out), "-m", "local"])
     assert res.exit_code == 0 and out.is_file()
     cfg = load_campaign(out, sets=[f"workdir={tmp_path}"])
     assert cfg.campaign.name == "demo"
 
 
 def test_init_writes_the_knobs_alongside(tmp_path):
-    """The tunable keys ship commented out, so they must not break parsing."""
+    """Every setting is live, with its alternatives beside it on the same line."""
     out = tmp_path / "c.yaml"
-    res = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local"])
+    res = runner.invoke(app, ["init", "1", "demo", "-o", str(out), "-m", "local"])
     assert res.exit_code == 0
     text = out.read_text()
-    assert "#   max_per_composition: 5" in text      # a knob you might reach for
-    assert "# 4. REFERENCE" in text                  # findable by funnel stage
+    assert "\n  max_per_composition: 5" in text      # live, even though it is the default
+    assert "# recompute | mp_energies" in text       # the alternatives, beside it
+    assert "# REFERENCE" in text                     # findable by funnel stage
     load_campaign(out, sets=[f"workdir={tmp_path}"])
 
 
 def test_init_minimal_drops_the_annotations(tmp_path):
     out = tmp_path / "c.yaml"
-    res = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local", "--minimal"])
+    res = runner.invoke(app, ["init", "1", "demo", "-o", str(out), "-m", "local", "--minimal"])
     assert res.exit_code == 0
-    assert "# 4. REFERENCE" not in out.read_text()
+    assert "# REFERENCE" not in out.read_text()
+    assert "|" not in out.read_text(), "trailing option comments are stripped too"
     load_campaign(out, sets=[f"workdir={tmp_path}"])
 
 
 def test_init_refuses_to_clobber(tmp_path):
     out = tmp_path / "c.yaml"
     out.write_text("existing")
-    res = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local"])
+    res = runner.invoke(app, ["init", "1", "demo", "-o", str(out), "-m", "local"])
     assert res.exit_code == 1 and out.read_text() == "existing"
-    ok = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local", "--force"])
+    ok = runner.invoke(app, ["init", "1", "demo", "-o", str(out), "-m", "local", "--force"])
     assert ok.exit_code == 0
 
 

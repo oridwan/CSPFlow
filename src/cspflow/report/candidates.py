@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..db.store import Store
+from .magnetics import summarise
 
 # The columns, in the order they are written, with a one-line meaning each.
 # Two of these are the same physical quantity computed two ways and they are
@@ -39,12 +40,22 @@ COLUMNS: list[tuple[str, str]] = [
     ("f_treatment", "which of the two above is meaningful"),
     ("m_per_formula_unit", "mu_B, from m_dft_raw"),
     ("m_per_volume", "mu_B / A^3, from m_dft_raw"),
+    ("mu0_m_tesla", "T, saturation polarisation mu0*M, from m_dft_raw / volume"),
+    ("m_emu_per_cc", "emu / cm^3, the same number in CGS"),
     ("state", "where the structure stopped"),
+    # Last, and adjacent to `state`, because it qualifies every number above it:
+    # a structure whose relax and static settled in different magnetic states has
+    # a geometry from one and an energy from the other. Empty for a clean run.
+    ("dft_warning", "why this row should not be read at face value"),
 ]
 
 # What each funnel gate means, in the order they run.
 GATE_ORDER = ["screen:validate", "screen:converged", "dedup", "dedup:seed_collision",
-              "filter:e_above_hull", "filter:per_composition"]
+              "filter:e_above_hull", "filter:per_composition",
+              # Not a filter: nothing is removed by failing it. It is in the
+              # funnel so that a run whose steps disagree is counted somewhere a
+              # person looks, rather than only on the row itself.
+              "dft:static:consistent_with_previous"]
 
 
 @dataclass
@@ -97,6 +108,16 @@ def candidate_rows(store: Store, *, states: tuple[str, ...] = ("dft_done",),
             record["formula"] = kv.get("reduced_formula") or row.formula
             record["n_atoms"] = int(row.natoms)
             record["state"] = state
+            # mu0*M is the number a reader compares against Nd2Fe14B, and it is
+            # one multiplication from the cell magnetisation and the volume.
+            # Derived here rather than stored, so it can never disagree with
+            # the two columns it comes from.
+            summary = summarise(kv.get("m_dft_raw"), kv.get("volume"),
+                                source="m_dft_raw")
+            record["mu0_m_tesla"] = summary.mu0_m
+            record["m_emu_per_cc"] = summary.emu_per_cc
+            if record.get("m_per_volume") is None:
+                record["m_per_volume"] = summary.m_per_volume
             out.append(record)
 
     def key(record: dict[str, Any]) -> tuple[int, float]:

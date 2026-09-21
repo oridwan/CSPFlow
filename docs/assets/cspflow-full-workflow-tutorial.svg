@@ -1,0 +1,382 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1664" viewBox="0 0 2560 1664" role="img" aria-labelledby="title desc">
+  <title id="title">CSPflow full workflow tutorial</title>
+  <desc id="desc">A numbered beginner tutorial showing how to create, configure, validate, run, monitor, and report a CSPflow crystal structure prediction campaign.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#061723"/>
+      <stop offset="0.58" stop-color="#08202d"/>
+      <stop offset="1" stop-color="#071923"/>
+    </linearGradient>
+    <linearGradient id="headerGlow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#35D9F2" stop-opacity="0.22"/>
+      <stop offset="0.58" stop-color="#35D9F2" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#F2B84B" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="phaseA" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#113c4a"/>
+      <stop offset="1" stop-color="#0c2d3a"/>
+    </linearGradient>
+    <linearGradient id="phaseB" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#45351f"/>
+      <stop offset="1" stop-color="#2b291f"/>
+    </linearGradient>
+    <pattern id="dotGrid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.3" fill="#35D9F2" opacity="0.13"/>
+    </pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="9" stdDeviation="12" flood-color="#000814" flood-opacity="0.45"/>
+    </filter>
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="9" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrowCyan" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 z" fill="#35D9F2"/>
+    </marker>
+    <marker id="arrowGold" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 z" fill="#F2B84B"/>
+    </marker>
+    <style><![CDATA[
+      .sans { font-family: "DejaVu Sans", sans-serif; }
+      .mono { font-family: "DejaVu Sans Mono", monospace; }
+      .title { font: 700 63px "DejaVu Sans", sans-serif; fill: #F3F7FA; letter-spacing: -1.5px; }
+      .subtitle { font: 400 25px "DejaVu Sans", sans-serif; fill: #B7CBD5; }
+      .eyebrow { font: 700 17px "DejaVu Sans", sans-serif; fill: #35D9F2; letter-spacing: 3.4px; }
+      .panel { fill: #0D2635; stroke: #1D4456; stroke-width: 2; }
+      .panel-soft { fill: #0A202D; stroke: #183D4E; stroke-width: 2; }
+      .card { fill: #102D3C; stroke: #245164; stroke-width: 1.5; }
+      .codebox { fill: #061822; stroke: #23495A; stroke-width: 1.5; }
+      .h2 { font: 700 28px "DejaVu Sans", sans-serif; fill: #F3F7FA; }
+      .h3 { font: 700 20px "DejaVu Sans", sans-serif; fill: #F3F7FA; }
+      .body { font: 400 18px "DejaVu Sans", sans-serif; fill: #C7D7DE; }
+      .small { font: 400 15px "DejaVu Sans", sans-serif; fill: #9FB5C3; }
+      .tiny { font: 400 13px "DejaVu Sans", sans-serif; fill: #8FA8B5; }
+      .code { font: 500 17px "DejaVu Sans Mono", monospace; fill: #EAF7FA; }
+      .code-sm { font: 500 14px "DejaVu Sans Mono", monospace; fill: #D9EDF1; }
+      .key { fill: #35D9F2; }
+      .gold { fill: #F2B84B; }
+      .green { fill: #66D19E; }
+      .warn { fill: #FF7B72; }
+      .muted { fill: #9FB5C3; }
+      .line { stroke: #416274; stroke-width: 2; fill: none; }
+      .stepCircle { fill: #35D9F2; stroke: #A2F4FF; stroke-width: 2; }
+      .stepNum { font: 800 22px "DejaVu Sans", sans-serif; fill: #061723; text-anchor: middle; dominant-baseline: central; }
+      .pill { fill: #123444; stroke: #2A6174; stroke-width: 1.5; }
+      .pillText { font: 700 13px "DejaVu Sans", sans-serif; fill: #CFE7EC; letter-spacing: .6px; }
+      .stage { fill: #102E3B; stroke: #2B5F70; stroke-width: 1.4; }
+      .stageGold { fill: #392F20; stroke: #8D6B30; stroke-width: 1.4; }
+      .stageText { font: 700 15px "DejaVu Sans", sans-serif; fill: #F3F7FA; text-anchor: middle; }
+    ]]></style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="2560" height="1664" fill="url(#bg)"/>
+  <rect width="2560" height="1664" fill="url(#dotGrid)" opacity="0.72"/>
+  <ellipse cx="215" cy="90" rx="470" ry="260" fill="#35D9F2" opacity="0.055"/>
+  <ellipse cx="2390" cy="1550" rx="520" ry="320" fill="#F2B84B" opacity="0.045"/>
+
+  <!-- Header -->
+  <rect x="48" y="42" width="2464" height="154" rx="28" fill="url(#headerGlow)" stroke="#255365" stroke-width="2"/>
+  <text x="84" y="76" class="eyebrow">BEGINNER MAP · CONFIGURE → CHECK → RUN → REPORT</text>
+  <text x="82" y="143" class="title">CSP<tspan fill="#35D9F2" font-style="italic">flow</tspan> full workflow</text>
+  <text x="852" y="143" class="subtitle">One campaign folder. Three YAML controls. Eight stages. Reproducible results.</text>
+  <g transform="translate(2188 67)">
+    <rect width="280" height="94" rx="20" fill="#081B27" stroke="#326479" stroke-width="2"/>
+    <text x="24" y="33" class="pillText" fill="#35D9F2">READ LEFT → RIGHT</text>
+    <text x="24" y="63" class="small">Follow steps 1–8</text>
+    <text x="24" y="82" class="tiny">Phase B is the costly part</text>
+  </g>
+
+  <!-- Decorative crystal motif -->
+  <g transform="translate(1990 74)" opacity="0.7">
+    <path d="M0 38 L34 8 L78 24 L87 66 L51 91 L9 77 Z M34 8 L51 91 M0 38 L87 66 M78 24 L9 77" fill="none" stroke="#35D9F2" stroke-width="2"/>
+    <g fill="#F3F7FA">
+      <circle cx="0" cy="38" r="5"/><circle cx="34" cy="8" r="5"/><circle cx="78" cy="24" r="5"/>
+      <circle cx="87" cy="66" r="5"/><circle cx="51" cy="91" r="5"/><circle cx="9" cy="77" r="5"/>
+    </g>
+  </g>
+
+  <!-- Row 1: Typed init -->
+  <g>
+    <rect x="48" y="220" width="500" height="272" rx="24" class="panel"/>
+    <circle cx="86" cy="258" r="25" class="stepCircle"/><text x="86" y="258" class="stepNum">1</text>
+    <text x="126" y="267" class="h2">Create from a type</text>
+    <rect x="76" y="294" width="444" height="77" rx="13" class="codebox"/>
+    <text x="96" y="325" class="code"><tspan class="key">$</tspan> csp init &lt;1|2|3&gt; test</text>
+    <text x="96" y="352" class="code"><tspan class="key">$</tspan> cd test</text>
+    <text x="78" y="399" class="small">Init asks whether to recompute references.</text>
+    <g transform="translate(78 416)">
+      <rect width="126" height="36" rx="18" class="pill"/><text x="17" y="23" class="pillText">campaign.yaml</text>
+      <rect x="138" width="126" height="36" rx="18" class="pill"/><text x="153" y="23" class="pillText">machine.yaml</text>
+      <rect x="276" width="126" height="36" rx="18" class="pill"/><text x="293" y="23" class="pillText">recipe.yaml</text>
+    </g>
+    <text x="78" y="478" class="tiny">Editable copies; the folder is the campaign.</text>
+  </g>
+
+  <!-- Arrow 1 to 2 -->
+  <path d="M550 356 H585" stroke="#35D9F2" stroke-width="4" marker-end="url(#arrowCyan)"/>
+
+  <!-- Row 1: Campaign types -->
+  <g>
+    <rect x="598" y="220" width="1914" height="272" rx="24" class="panel"/>
+    <circle cx="636" cy="258" r="25" class="stepCircle"/><text x="636" y="258" class="stepNum">2</text>
+    <text x="676" y="267" class="h2">Choose the campaign type</text>
+    <text x="1110" y="266" class="small">The template is examples/&lt;N&gt;-*/ — each type starts a different funnel.</text>
+
+    <g transform="translate(626 292)">
+      <rect width="575" height="150" rx="17" class="card"/>
+      <circle cx="40" cy="40" r="25" class="stepCircle"/><text x="40" y="40" class="stepNum">1</text>
+      <text x="79" y="37" class="h3">chemical_space</text>
+      <text x="79" y="59" class="tiny">aliases: space · sweep</text>
+      <text x="24" y="91" class="code-sm"><tspan class="key">$</tspan> csp init 1 test</text>
+      <text x="24" y="117" class="small">You edit element groups; cspflow enumerates formulas.</text>
+      <text x="24" y="140" class="tiny">No demo input files · largest size multiplier</text>
+    </g>
+    <g transform="translate(1220 292)">
+      <rect width="575" height="150" rx="17" class="card"/>
+      <circle cx="40" cy="40" r="25" fill="#66D19E" stroke="#B7F5D6" stroke-width="2"/><text x="40" y="40" class="stepNum">2</text>
+      <text x="79" y="37" class="h3">composition_list</text>
+      <text x="79" y="59" class="tiny">aliases: compositions · formulas</text>
+      <rect x="429" y="20" width="122" height="29" rx="14" fill="#173A33" stroke="#3E866B"/>
+      <text x="447" y="40" class="pillText" fill="#66D19E">DEMO CSV</text>
+      <text x="24" y="91" class="code-sm"><tspan class="key">$</tspan> csp init 2 test</text>
+      <text x="24" y="117" class="small">You give formulas; replace inputs/compositions.csv.</text>
+      <text x="24" y="140" class="tiny">Inline items and CSV can be used together.</text>
+    </g>
+    <g transform="translate(1814 292)">
+      <rect width="670" height="150" rx="17" class="card"/>
+      <circle cx="40" cy="40" r="25" fill="#F2B84B" stroke="#FFE0A1" stroke-width="2"/><text x="40" y="40" class="stepNum">3</text>
+      <text x="79" y="37" class="h3">structure_list</text>
+      <text x="79" y="59" class="tiny">aliases: structures · seeds</text>
+      <rect x="459" y="20" width="181" height="29" rx="14" fill="#3E321D" stroke="#8D6B30"/>
+      <text x="477" y="40" class="pillText" fill="#F2B84B">5 DEMO SEEDS</text>
+      <text x="24" y="91" class="code-sm"><tspan class="key">$</tspan> csp init 3 test</text>
+      <text x="24" y="117" class="small">Replace the Sm–Fe files in inputs/seeds/.</text>
+      <text x="24" y="140" class="tiny">No generate block or source.defaults · enters at screen</text>
+    </g>
+    <rect x="626" y="452" width="1858" height="30" rx="15" fill="#291F1F" stroke="#68423F"/>
+    <text x="647" y="472" class="tiny"><tspan class="warn">MENU / SAFE STOP:</tspan>  csp init test asks interactively; scripts exit and write nothing.  csp init 7 test or csp init 2 prints the menu + correct usage.</text>
+  </g>
+
+  <!-- Row 2: Configure -->
+  <g>
+    <rect x="48" y="516" width="1742" height="428" rx="24" class="panel"/>
+    <circle cx="86" cy="554" r="25" class="stepCircle"/><text x="86" y="554" class="stepNum">3</text>
+    <text x="126" y="563" class="h2">Configure three YAML control surfaces</text>
+    <text x="812" y="562" class="small">Start with campaign.yaml; change the other two only for cluster or DFT policy.</text>
+
+    <g transform="translate(76 590)">
+      <rect width="544" height="294" rx="18" class="card"/>
+      <text x="24" y="38" class="h3"><tspan class="key">campaign.yaml</tspan> · WHAT + HOW MUCH</text>
+      <text x="24" y="70" class="code-sm"><tspan class="key">name / machine / workdir</tspan></text>
+      <text x="24" y="94" class="code-sm"><tspan class="gold">source 1–2</tspan>   Z · max_atoms · n_structures</text>
+      <text x="24" y="118" class="code-sm"><tspan class="gold">source 3</tspan>     paths · relax · dedup · max_atoms</text>
+      <text x="24" y="142" class="code-sm"><tspan class="gold">generate</tspan>     MatterGen · types 1–2 only</text>
+      <text x="24" y="166" class="code-sm"><tspan class="gold">screen</tspan>       mattersim | chgnet · fmax · dedup</text>
+      <text x="24" y="190" class="code-sm"><tspan class="gold">reference</tspan>    recompute | mp_energies</text>
+      <text x="24" y="214" class="code-sm"><tspan class="gold">energy_source</tspan> dft | mlip | mp</text>
+      <text x="24" y="238" class="code-sm"><tspan class="gold">filter</tspan>       hull cut · composition / symmetry caps</text>
+      <text x="24" y="262" class="code-sm"><tspan class="gold">dft</tspan>          POTCAR · magnetism · caps · selection</text>
+      <text x="24" y="284" class="tiny">Only live, type-aligned settings are in each example.</text>
+    </g>
+
+    <g transform="translate(638 590)">
+      <rect width="522" height="294" rx="18" class="card"/>
+      <text x="24" y="38" class="h3"><tspan class="key">machine.yaml</tspan> · WHERE</text>
+      <text x="24" y="70" class="code-sm"><tspan class="gold">scheduler:</tspan> slurm | local</text>
+      <text x="24" y="98" class="code-sm"><tspan class="gold">roles:</tspan> cpu / gpu / short</text>
+      <text x="24" y="126" class="code-sm"><tspan class="gold">defaults:</tspan> account · qos · partition</text>
+      <text x="24" y="154" class="code-sm"><tspan class="gold">modules / env:</tspan> runtime setup</text>
+      <text x="24" y="182" class="code-sm"><tspan class="gold">codes:</tspan> vasp_std executable</text>
+      <text x="24" y="210" class="code-sm"><tspan class="gold">potcars:</tspan> VASP6.4 / PBE_64 roots</text>
+      <text x="24" y="238" class="code-sm"><tspan class="gold">scratch / conda / limits</tspan></text>
+      <text x="24" y="275" class="tiny">Roles keep campaigns portable between clusters.</text>
+    </g>
+
+    <g transform="translate(1178 590)">
+      <rect width="584" height="294" rx="18" class="card"/>
+      <text x="24" y="38" class="h3"><tspan class="key">recipe.yaml</tspan> · EXACT VASP LADDER</text>
+      <text x="24" y="70" class="code-sm"><tspan class="gold">steps:</tspan> relax → static</text>
+      <text x="24" y="98" class="code-sm"><tspan class="gold">incar:</tspan> ENCUT · ISMEAR · EDIFF · ISIF · ...</text>
+      <text x="24" y="126" class="code-sm"><tspan class="gold">kpoints:</tspan> reciprocal_density | mesh</text>
+      <text x="24" y="154" class="code-sm"><tspan class="gold">resources:</tspan> role · ntasks · mem · time</text>
+      <text x="24" y="182" class="code-sm"><tspan class="gold">inherit:</tspan> CHGCAR | WAVECAR | CONTCAR</text>
+      <text x="24" y="210" class="code-sm"><tspan class="gold">retry:</tspan> ordered remedies for known failures</text>
+      <text x="24" y="247" class="small">Campaign-wide overlays:</text>
+      <text x="24" y="273" class="code-sm">dft.incar_overrides · nbands · ldau</text>
+    </g>
+
+    <g transform="translate(76 899)">
+      <rect width="1686" height="27" rx="13" fill="#08202B"/>
+      <text x="18" y="19" class="tiny">OPTION MAP  ·  magnetism: ferrimagnetic_retm | ferromagnetic | table | pymatgen | none   ·   f-electrons: frozen | valence   ·   layout: runs | stages   ·   combined_job: true | false</text>
+    </g>
+  </g>
+
+  <!-- Arrow 3 to 4 -->
+  <path d="M1792 730 H1820" stroke="#35D9F2" stroke-width="4" marker-end="url(#arrowCyan)"/>
+
+  <!-- Row 2: Validate -->
+  <g>
+    <rect x="1832" y="516" width="680" height="428" rx="24" class="panel"/>
+    <circle cx="1870" cy="554" r="25" class="stepCircle"/><text x="1870" y="554" class="stepNum">4</text>
+    <text x="1910" y="563" class="h2">Validate before compute</text>
+    <rect x="1860" y="592" width="624" height="165" rx="15" class="codebox"/>
+    <text x="1884" y="626" class="code"><tspan class="key">$</tspan> csp doctor</text>
+    <text x="1884" y="659" class="code"><tspan class="key">$</tspan> csp source --dry-run</text>
+    <text x="1884" y="692" class="code"><tspan class="key">$</tspan> csp config show --origins</text>
+    <text x="1884" y="725" class="code"><tspan class="key">$</tspan> csp recipe</text>
+    <g transform="translate(1862 782)">
+      <circle cx="9" cy="4" r="5" fill="#66D19E"/><text x="26" y="10" class="small">Structure count is affordable</text>
+      <circle cx="9" cy="37" r="5" fill="#66D19E"/><text x="26" y="43" class="small">Modules, VASP and POTCARs resolve</text>
+      <circle cx="9" cy="70" r="5" fill="#66D19E"/><text x="26" y="76" class="small">Reference recipe matches campaign DFT</text>
+      <circle cx="9" cy="103" r="5" fill="#66D19E"/><text x="26" y="109" class="small">Resolved settings are what you intended</text>
+    </g>
+    <rect x="1860" y="907" width="624" height="22" rx="11" fill="#17362E"/>
+    <text x="2172" y="923" class="tiny green" text-anchor="middle">These checks submit nothing.</text>
+  </g>
+
+  <!-- Row 3: Phase A -->
+  <g>
+    <rect x="48" y="968" width="708" height="300" rx="24" fill="url(#phaseA)" stroke="#2B6576" stroke-width="2"/>
+    <circle cx="86" cy="1006" r="25" class="stepCircle"/><text x="86" y="1006" class="stepNum">5</text>
+    <text x="126" y="1015" class="h2">Run Phase A</text>
+    <rect x="78" y="1040" width="648" height="57" rx="13" class="codebox"/>
+    <text x="101" y="1076" class="code"><tspan class="key">$</tspan> csp run --through reference</text>
+    <text x="80" y="1125" class="small">Cheap preparation runs to completion first.</text>
+    <g transform="translate(78 1152)">
+      <rect width="100" height="48" rx="12" class="stage"/><text x="50" y="30" class="stageText">source</text>
+      <path d="M104 24 H126" stroke="#35D9F2" stroke-width="3" marker-end="url(#arrowCyan)"/>
+      <rect x="132" width="112" height="48" rx="12" class="stage"/><text x="188" y="30" class="stageText">generate</text>
+      <path d="M248 24 H270" stroke="#35D9F2" stroke-width="3" marker-end="url(#arrowCyan)"/>
+      <rect x="276" width="100" height="48" rx="12" class="stage"/><text x="326" y="30" class="stageText">screen</text>
+      <path d="M380 24 H402" stroke="#35D9F2" stroke-width="3" marker-end="url(#arrowCyan)"/>
+      <rect x="408" width="100" height="48" rx="12" class="stage"/><text x="458" y="30" class="stageText">dedup</text>
+      <path d="M512 24 H534" stroke="#35D9F2" stroke-width="3" marker-end="url(#arrowCyan)"/>
+      <rect x="540" width="108" height="48" rx="12" class="stage"/><text x="594" y="30" class="stageText">reference</text>
+    </g>
+    <text x="80" y="1232" class="tiny">structure_list enters at screen; generation is automatically skipped.</text>
+  </g>
+
+  <!-- Arrow A to B -->
+  <path d="M758 1118 H785" stroke="#F2B84B" stroke-width="4" marker-end="url(#arrowGold)"/>
+
+  <!-- Row 3: Phase B -->
+  <g>
+    <rect x="796" y="968" width="784" height="300" rx="24" fill="url(#phaseB)" stroke="#80622E" stroke-width="2"/>
+    <circle cx="834" cy="1006" r="25" fill="#F2B84B" stroke="#FFE0A1" stroke-width="2"/><text x="834" y="1006" class="stepNum">6</text>
+    <text x="874" y="1015" class="h2">Run Phase B</text>
+    <rect x="826" y="1040" width="724" height="57" rx="13" class="codebox"/>
+    <text x="849" y="1076" class="code"><tspan class="gold">$</tspan> csp run --from filter --watch</text>
+    <g transform="translate(826 1120)">
+      <rect width="135" height="54" rx="13" class="stageGold"/><text x="67" y="33" class="stageText">filter</text>
+      <path d="M140 27 H173" stroke="#F2B84B" stroke-width="3" marker-end="url(#arrowGold)"/>
+      <rect x="180" width="242" height="54" rx="13" class="stageGold"/><text x="301" y="33" class="stageText">DFT: relax → static</text>
+      <path d="M428 27 H461" stroke="#F2B84B" stroke-width="3" marker-end="url(#arrowGold)"/>
+      <rect x="468" width="165" height="54" rx="13" class="stageGold"/><text x="550" y="33" class="stageText">analyze</text>
+    </g>
+    <text x="826" y="1200" class="small">Cap the spend:</text>
+    <text x="957" y="1200" class="code-sm">max_cores · max_in_flight · select.max_total</text>
+    <text x="826" y="1228" class="tiny">Ctrl-C stops the watcher safely; run the same command to resume.</text>
+    <rect x="826" y="1240" width="724" height="18" rx="9" fill="#45351E"/>
+    <text x="1188" y="1254" class="tiny gold" text-anchor="middle">EXPENSIVE: VASP jobs begin here</text>
+  </g>
+
+  <!-- Arrow B to Monitor -->
+  <path d="M1582 1118 H1608" stroke="#35D9F2" stroke-width="4" marker-end="url(#arrowCyan)"/>
+
+  <!-- Row 3: Monitor -->
+  <g>
+    <rect x="1620" y="968" width="892" height="300" rx="24" class="panel"/>
+    <circle cx="1658" cy="1006" r="25" class="stepCircle"/><text x="1658" y="1006" class="stepNum">7</text>
+    <text x="1698" y="1015" class="h2">Monitor and inspect</text>
+    <rect x="1650" y="1040" width="400" height="139" rx="13" class="codebox"/>
+    <text x="1673" y="1075" class="code"><tspan class="key">$</tspan> csp status</text>
+    <text x="1673" y="1109" class="code"><tspan class="key">$</tspan> csp status --why &lt;id&gt;</text>
+    <text x="1673" y="1143" class="code"><tspan class="key">$</tspan> squeue --me</text>
+    <g transform="translate(2070 1040)">
+      <rect width="414" height="139" rx="13" class="codebox"/>
+      <text x="20" y="29" class="code-sm">results/dft/runs/&lt;structure&gt;/</text>
+      <text x="20" y="55" class="code-sm muted">├── seed.vasp</text>
+      <text x="20" y="79" class="code-sm muted">├── relax/   INCAR · OUTCAR · CONTCAR</text>
+      <text x="20" y="103" class="code-sm muted">└── static/  INCAR · OUTCAR · vasprun.xml</text>
+      <text x="20" y="127" class="tiny">One readable directory per structure.</text>
+    </g>
+    <rect x="1650" y="1200" width="834" height="45" rx="13" fill="#102C39" stroke="#2B5668"/>
+    <text x="1670" y="1228" class="code-sm"><tspan class="gold">ORION / unattended:</tspan> sbatch .../campaign_driver.sbatch . "" 300</text>
+  </g>
+
+  <!-- Row 4: Results -->
+  <g>
+    <rect x="48" y="1292" width="650" height="324" rx="24" class="panel"/>
+    <circle cx="86" cy="1330" r="25" class="stepCircle"/><text x="86" y="1330" class="stepNum">8</text>
+    <text x="126" y="1339" class="h2">Produce the report</text>
+    <rect x="78" y="1364" width="590" height="57" rx="13" class="codebox"/>
+    <text x="101" y="1400" class="code"><tspan class="key">$</tspan> csp report</text>
+    <g transform="translate(78 1447)">
+      <rect width="277" height="67" rx="15" class="card"/>
+      <text x="20" y="29" class="h3">report.html</text>
+      <text x="20" y="51" class="tiny">Self-contained visual report</text>
+      <rect x="295" width="295" height="67" rx="15" class="card"/>
+      <text x="315" y="29" class="h3">candidates.csv</text>
+      <text x="315" y="51" class="tiny">Ranked, script-friendly table</text>
+    </g>
+    <text x="78" y="1550" class="small">Inspect:</text>
+    <text x="148" y="1550" class="small">structures · hull energies · moments</text>
+    <text x="78" y="1578" class="small">volume · space group · rejection reasons</text>
+    <rect x="78" y="1592" width="590" height="8" rx="4" fill="#35D9F2" opacity="0.55"/>
+  </g>
+
+  <!-- Arrow 7 to 8 reading cue -->
+  <path d="M1658 1270 C1658 1303 1160 1309 718 1331" stroke="#35D9F2" stroke-width="2.5" stroke-dasharray="8 9" fill="none" marker-end="url(#arrowCyan)" opacity="0.75"/>
+
+  <!-- YAML and run controls -->
+  <g>
+    <rect x="720" y="1292" width="1792" height="324" rx="24" fill="#0D2635" stroke="#2B5F70" stroke-width="2"/>
+    <rect x="720" y="1292" width="16" height="324" rx="8" fill="#35D9F2"/>
+    <text x="764" y="1338" class="h2"><tspan class="key">EDIT YAML</tspan> &amp; TRY CHANGES SAFELY</text>
+    <text x="1450" y="1337" class="small">Read comments, preview the result, then run only what you intend.</text>
+
+    <!-- Column 1: YAML notation -->
+    <g transform="translate(764 1360)">
+      <rect width="530" height="204" rx="17" class="card"/>
+      <rect width="530" height="5" rx="3" fill="#35D9F2"/>
+      <text x="22" y="34" class="pillText gold">1 · HOW TO READ THE YAML</text>
+      <text x="22" y="60" class="small">Every uncommented setting is live.</text>
+      <text x="22" y="91" class="code-sm">magnetic_order: ferri</text>
+      <text x="236" y="91" class="code-sm muted"># ferri | ferro | none</text>
+      <text x="22" y="119" class="code-sm">elements: [Sm, Tb]</text>
+      <text x="236" y="119" class="code-sm muted"># comma-separated list</text>
+      <text x="22" y="147" class="code-sm">overrides: {Sm: Sm_3, Ti: Ti_pv}</text>
+      <text x="22" y="168" class="tiny muted">Several key-value pairs use commas inside { }.</text>
+      <text x="22" y="192" class="tiny"><tspan class="gold">Keep indentation.</tspan> Unknown keys are rejected.</text>
+    </g>
+
+    <!-- Column 2: preview and overrides -->
+    <g transform="translate(1312 1360)">
+      <rect width="548" height="204" rx="17" class="card"/>
+      <rect width="548" height="5" rx="3" fill="#35D9F2"/>
+      <text x="22" y="34" class="pillText gold">2 · PREVIEW &amp; OVERRIDE</text>
+      <text x="22" y="68" class="code-sm"><tspan class="key">$</tspan> csp source --dry-run</text>
+      <text x="22" y="96" class="code-sm"><tspan class="key">$</tspan> csp config show --origins</text>
+      <text x="22" y="124" class="code-sm"><tspan class="key">$</tspan> csp recipe</text>
+      <text x="22" y="152" class="code-sm"><tspan class="key">$</tspan> csp run --set filter.e_above_hull_max=0.05</text>
+      <text x="22" y="182" class="tiny"><tspan class="gold">--set is temporary;</tspan> campaign.yaml is unchanged.</text>
+    </g>
+
+    <!-- Column 3: stage control -->
+    <g transform="translate(1878 1360)">
+      <rect width="592" height="204" rx="17" class="card"/>
+      <rect width="592" height="5" rx="3" fill="#35D9F2"/>
+      <text x="22" y="34" class="pillText gold">3 · CONTROL THE STAGES</text>
+      <text x="22" y="68" class="code-sm"><tspan class="key">$</tspan> csp run --only screen</text>
+      <text x="22" y="96" class="code-sm"><tspan class="key">$</tspan> csp run --through dedup</text>
+      <text x="22" y="124" class="code-sm"><tspan class="key">$</tspan> csp run --from dft</text>
+      <text x="22" y="152" class="code-sm"><tspan class="key">$</tspan> csp run --from filter --watch</text>
+      <text x="22" y="182" class="tiny">Ctrl-C is safe; submitted jobs continue. Run again to resume.</text>
+    </g>
+
+    <rect x="764" y="1584" width="1706" height="1.5" fill="#285466"/>
+    <text x="764" y="1605" class="tiny">Settings: docs/06-settings.md  ·  DFT recipes: docs/09-recipes.md  ·  Command reference: docs/12-cli.md</text>
+  </g>
+</svg>

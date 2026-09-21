@@ -20,7 +20,7 @@ from cspflow.reference.mp import (
     ReferenceEntry,
     ReferenceError,
     assert_scale_matches_thermo_type,
-    cache_root,
+    reference_root,
     compare_snapshots,
     fetch_chemsys,
     snapshot_id,
@@ -146,8 +146,8 @@ class TestCache:
 
     def test_the_cache_lives_outside_any_campaign(self, monkeypatch, tmp_path):
         """Two campaigns touching Sm-Fe-Ti pay for its reference hull once."""
-        monkeypatch.setenv("CSPFLOW_CACHE", str(tmp_path / "shared"))
-        assert cache_root() == tmp_path / "shared"
+        monkeypatch.setenv("CSPFLOW_REFERENCE", str(tmp_path / "shared"))
+        assert reference_root() == tmp_path / "shared"
 
     def test_no_key_and_no_cache_is_a_clear_error(self, monkeypatch, tmp_path):
         monkeypatch.delenv("MP_API_KEY", raising=False)

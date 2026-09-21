@@ -65,9 +65,33 @@ class StructureProperties:
     m_per_formula_unit: float | None = None
     m_per_volume: float | None = None      # mu_B / A^3
     sublattice: dict[str, float] = field(default_factory=dict)
+    # Every ion's projected moment, by channel.  Kept because it used to be
+    # parsed and thrown away: `read_site_moments` builds one `SiteMoment` per
+    # ion and only the two sublattice sums survived into the database, so the
+    # per-site table -- the thing that says WHICH Fe carries the magnet --
+    # existed nowhere afterwards and could only be recovered by going back to
+    # the OUTCAR on scratch.
+    site_moments: list[dict[str, Any]] = field(default_factory=list)
     f_treatment: str = "frozen"
 
     warnings: list[str] = field(default_factory=list)
+
+    def as_data(self) -> dict[str, Any]:
+        """The structured part, for ASE's `data` blob rather than its key-values.
+
+        `key_value_pairs` holds only str/int/float/bool, so a 68-row table
+        cannot go there.  `data` round-trips JSON and is not queryable, which
+        is the right trade: nothing selects on an individual ion's moment, and
+        everything that wants to read one wants all of them at once.
+        """
+        out: dict[str, Any] = {}
+        if self.site_moments:
+            out["site_moments"] = self.site_moments
+        if self.sublattice:
+            out["sublattice"] = self.sublattice
+        if self.m_spheres is not None:
+            out["m_spheres"] = self.m_spheres
+        return out
 
     def as_kv(self) -> dict[str, Any]:
         """The subset that goes into the database as key-value pairs.
@@ -190,6 +214,11 @@ def _apply_moments(props: StructureProperties, moments: MomentReport,
 
     props.sublattice = {"rare_earth": moments.rare_earth,
                         "transition_metal": moments.transition_metal}
+    props.site_moments = [
+        {"i": site.index, "el": site.element, "tot": round(site.total, 4),
+         **{k: round(v, 4) for k, v in site.channels.items()}}
+        for site in moments.sites
+    ]
     rare_earth_counts = counts_of(symbols, RARE_EARTHS)
     result = reconstruct(moments.transition_metal, rare_earth_counts,
                          f_treatment=props.f_treatment)

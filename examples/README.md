@@ -1,16 +1,65 @@
 # Example campaigns
 
-Three complete campaigns, one per source mode. Each is a folder you can copy
-and run; every block is populated with a realistic value and commented with
-what else it could have been.
+Three complete campaigns, one per **campaign type**. They are also the
+templates: `csp init <type> <name>` copies one of these folders and changes
+four lines of its `campaign.yaml` (`name`, `machine`, `dft.recipe`,
+`reference.mode`), so an example and the campaign it starts cannot drift apart.
 
-| | mode | the question it answers | input |
-|---|---|---|---|
-| [`1-chemical-space/`](1-chemical-space/) | `chemical_space` | "search this region of the periodic table" | element groups in the YAML |
-| [`2-composition-list/`](2-composition-list/) | `composition_list` | "I know which formulas I want" | inline items **and** [`inputs/compositions.csv`](2-composition-list/inputs/compositions.csv) |
-| [`3-structure-list/`](3-structure-list/) | `structure_list` | "I already have the structures" | five real POSCARs in [`inputs/seeds/`](3-structure-list/inputs/seeds/) |
+| type | folder | source mode | the question it answers | input |
+|---|---|---|---|---|
+| `1` | [`1-chemical-space/`](1-chemical-space/) | `chemical_space` | "search this region of the periodic table" | element groups in the YAML |
+| `2` | [`2-composition-list/`](2-composition-list/) | `composition_list` | "I know which formulas I want" | inline items **and** [`inputs/compositions.csv`](2-composition-list/inputs/compositions.csv) |
+| `3` | [`3-structure-list/`](3-structure-list/) | `structure_list` | "I already have the structures" | five real POSCARs in [`inputs/seeds/`](3-structure-list/inputs/seeds/) |
 
-Check any of them without running anything:
+## To use one
+
+```bash
+csp init 2 my-shortlist      # 1, 2 or 3 -- or the mode name
+cd my-shortlist
+csp doctor
+csp source --dry-run
+```
+
+`csp init my-shortlist` without a type prints the table above and asks.
+
+## What is in each folder
+
+Every example is a complete campaign of three YAML files, exactly what
+`csp init` writes:
+
+| file | what it is |
+|---|---|
+| `campaign.yaml` | what to search, and how hard -- different for each type |
+| `machine.yaml` | a copy of the shipped `orion` profile, as `csp init` makes it |
+| `recipe.yaml` | a copy of the shipped `magnets` DFT recipe, as `csp init` makes it |
+
+The machine and recipe copies are generated, not hand-edited; a test pins them
+to what `csp init` produces from the shipped files.
+
+## How to read `campaign.yaml`
+
+Every line that is not a comment is a **live setting**, written out even where
+it equals the default. The comment beside it says what else it can be:
+
+```yaml
+magnetic_order: ferri        # ferri | ferro | none                 <- pick ONE
+pick: 1                      # one number, or several: [1, 2]
+elements: [Sm, Tb]           # several: [Sm, Nd, Pr, ...]           <- comma-separated list
+overrides: {}                # several: {Sm: Sm_3, Ti: Ti_pv}       <- several key: value pairs
+```
+
+Every value listed after `# a | b | c` is checked against the schema by
+`tests/unit/test_examples.py`, so a listed option is one the pipeline accepts.
+
+**What is deliberately not there.** Settings that apply to another type (a
+`structure_list` campaign has no `generate:` block and no `source.defaults`), and
+settings the schema still accepts but no code reads: `calibrate:` (removed from
+the funnel, D126), `archive:`, `analyze:`, `filter.e_above_hull_max_source`,
+`dft.select.max_per_composition`, and `reference.functionals / prescreen_mode /
+prescreen_hull_max / snapshot / snapshot_id / relax_with_mlip / cache`. An
+existing campaign that sets them still loads. See D146.
+
+## Check without running anything
 
 ```bash
 csp source --dry-run -c examples/1-chemical-space/campaign.yaml
@@ -25,24 +74,9 @@ csp source --dry-run -c examples/1-chemical-space/campaign.yaml
 Those numbers are asserted by `tests/unit/test_examples.py`, so an example that
 stops matching its own description fails the suite rather than misleading you.
 
-## To use one
-
-```bash
-cp -r examples/2-composition-list my-campaign
-cd my-campaign
-$EDITOR campaign.yaml
-csp doctor
-```
-
-The examples name a shipped machine profile (`machine: orion`) rather than
-carrying a copy, because three copies of the same profile in one repository is
-noise. A real campaign made with `csp init` gets its own editable
-`machine.yaml` and `recipe.yaml` in the folder — that is the difference between
-these read-me examples and a working campaign.
-
 ## What each one is really demonstrating
 
-**1 — chemical_space** is the mode with a size multiplier hidden in it. `pick`
+**1 — chemical_space** is the type with a size multiplier hidden in it. `pick`
 has no default for that reason, and `max_atoms_formula` is the dial that moves
 the composition count fastest. Run `--dry-run` before you believe any sweep.
 
@@ -53,11 +87,10 @@ exceptions you are making today. The example does this on purpose with
 `SmFe11Ti` and warns about it when you run it.
 
 **3 — structure_list** has no `generate:` block, which is what tells the driver
-Stage 1 has nothing to do. Its seeds are five DFT-relaxed Sm-Fe structures from
-a finished campaign — Sm₂Fe₁₇ (hR19), SmFe₁₂ (tI26), SmFe₅, SmFe₄, SmFe₃ — so
-the parsing, composition-derivation and `max_atoms` gate all run against real
-files. It also carries a commented second source that turns the campaign into a
-seeds-versus-generated control group.
+there is nothing to generate. Its seeds are five DFT-relaxed Sm-Fe structures
+from a finished campaign — Sm₂Fe₁₇ (hR19), SmFe₁₂ (tI26), SmFe₅, SmFe₄, SmFe₃ —
+so the parsing, composition-derivation and `max_atoms` gate all run against real
+files.
 
 ## The CSV format
 

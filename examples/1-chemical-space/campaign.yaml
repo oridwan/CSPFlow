@@ -1,100 +1,73 @@
 # ===========================================================================
-#  EXAMPLE 1 of 3 -- source mode: chemical_space
+#  EXAMPLE 1 of 3 -- campaign type 1: chemical_space
 #
 #  "Search a region of the periodic table."  You name element groups and how
 #  many elements to take from each; cspflow assembles every chemical system
 #  the rules allow, enumerates the formulas inside each one, and generates
 #  structures for all of them.
 #
-#  This is the mode with a size multiplier hiding in it. The sweep below is
-#  36 ternary systems / 3,384 compositions / ~165,000 structures -- check it
+#  This is the type with a size multiplier hiding in it. The sweep below is
+#  36 ternary systems / 3,384 compositions / 165,456 structures -- check it
 #  with `csp source --dry-run` BEFORE you run anything.
 #
-#  Copy this folder, or:  csp init my-sweep -m orion
+#  Start your own from this file:   csp init 1 my-sweep
+#
+#  How to read it: every line that is not a comment is a live setting, written
+#  out even where it equals the default. Where a setting takes one of a fixed
+#  set of values, the others are listed beside it as  # a | b | c  (pick ONE).
+#  Where a setting takes SEVERAL at once, the comment starts  # several:
+#  and shows the comma-separated form, e.g.  [Sm, Nd, Pr]  or  {Sm: Sm_3, Ti: Ti_pv}.
 # ===========================================================================
 
 name: example-sweep
-machine: orion                  # shipped: orion | generic_slurm | local.
-                                # `csp init` copies the profile in as
-                                # machine.yaml so you can edit it; a path to
-                                # any YAML file works here too.
-workdir: /scratch/$USER/cspflow/example-sweep    # database, job dirs, VASP output
-archive: /projects/mmi/Ridwan/cspflow_archive/example-sweep   # null to keep nothing
+machine: machine.yaml            # this folder's copy | orion | generic_slurm | local | any path
+workdir: results                 # beside this file; an absolute path puts output elsewhere
 
 # ---------------------------------------------------------------------------
-# SOURCE
+# SOURCE -- what to search
 # ---------------------------------------------------------------------------
 source:
-  - mode: chemical_space
-    name: sweep                 # required once a campaign has >1 source; it is
-                                # how a candidate's origin stays answerable
+  - mode: chemical_space         # this file's type; `csp init 1|2|3` starts another
+    name: sweep                  # stamped on every row; needed once there are 2+ sources
     chemical_space:
-
       # Each group is a pool plus how many elements to take from it. Group
       # names (A/B/C) are labels only -- call them RE/TM/X if you prefer.
-      groups:
-
-        # Rare earths. pick: 1 -> one RE per system.
-        A:
-          elements: [Sm, Tb]
-          pick: 1               # int, or a list of arities: [1, 2] would also
-                                # emit systems taking two from this group
-
-        # The magnetic transition metals, held to at least 75% of the formula:
-        # a magnet is mostly Fe. Without min_fraction the sweep spends most of
-        # its budget on RE-rich compositions that cannot be what you want.
-        B:
-          elements: [Fe, Co, Ni]
+      groups:                    # several: one named group per block (A, B, C, ...)
+        A:                       # rare earths
+          elements: [Sm, Tb]     # several: [Sm, Nd, Pr, ...] -- the pool for this group
+          pick: 1                # one number, or several: [1, 2] takes 1 AND 2 from this group
+        B:                       # the magnetic transition metals
+          elements: [Fe, Co, Ni]  # several: comma-separated element symbols
           pick: 1
-          min_fraction: 0.75    # of the atoms in the reduced formula
-          # max_fraction: 0.95  # the other side of the same constraint
-
-        # Stabilisers / substituents.
-        C:
-          elements: [Ti, V, Cr, Mn, Cu, Zn]
+          min_fraction: 0.75     # of the reduced formula; a magnet is mostly Fe
+        C:                       # stabilisers / substituents
+          elements: [Ti, V, Cr, Mn, Cu, Zn]   # several: comma-separated element symbols
           pick: 1
-          # min_fraction: 0.02  # force a non-trivial amount in
-          # max_fraction: 0.15  # keep it a dopant rather than a component
+      max_atoms_formula: 20      # cap on the REDUCED formula (Sm2Fe17 = 19); the main size dial
+      max_rare_earth: 1          # RE species per system; null = no limit
 
-      max_atoms_formula: 20     # cap on the REDUCED formula (Sm2Fe17 = 19).
-                                # Raise it and the composition count climbs
-                                # steeply; this is the sweep's main size dial.
-
-      max_rare_earth: 1         # RE *species* in the assembled system, not the
-                                # count within one group. Separate on purpose:
-                                # {Sm,Tb} with pick: 2 would otherwise emit
-                                # Sm-Tb-Fe unasked. null = no limit.
-
-    # Applied to every composition the sweep produces; per-item overrides are
-    # only available in composition_list (see example 2).
-    defaults:
-      z: {min: 1, max: 2}       # formula units of the REDUCED formula to build.
-                                # Sm2Fe17 at z=2 is a 38-atom cell.
-      max_atoms: 40             # hard cap on z * atoms-per-formula-unit. A row
-                                # whose z would exceed this is dropped, not
-                                # silently shrunk.
+    defaults:                    # applied to every composition the sweep produces
+      z:
+        min: 1                   # formula units of the reduced formula
+        max: 2                   # Sm2Fe17 at z=2 is a 38-atom cell
+      max_atoms: 40              # z * atoms-per-formula; an over-cap z is dropped, not shrunk
       n_structures:
-        mode: per_atom          # per_atom | fixed
-        structures_per_atom: 2.0    # 20-atom cell -> 40 structures
-        # mode: fixed
-        # count: 50             # same number for every row, regardless of size
-      n_structures_scope: per_z  # per_z | total -- whether the count above is
-                                # per Z value or split across the Z range
+        mode: per_atom           # per_atom | fixed  (fixed takes `count: N` instead)
+        structures_per_atom: 2.0  # 20-atom cell -> 40 structures
+      n_structures_scope: per_z  # per_z | total
 
 # ---------------------------------------------------------------------------
 # GENERATE -- MatterGen, one job per composition batch
 # ---------------------------------------------------------------------------
 generate:
-  engine: mattergen             # the only engine implemented
+  engine: mattergen              # the only engine implemented
   mattergen:
     model: /projects/mmi/shuo/MatterGen_checkpoints/18-55-08
-    mode: csp                   # csp: condition on composition (what you want
-                                # here) | unconditional: ignore it
-    max_batch_size: 100         # structures per forward pass; lower it if the
-                                # GPU runs out of memory
-    timeout_per_batch: 1800     # seconds before a batch is abandoned
+    mode: csp                    # csp | unconditional
+    max_batch_size: 100          # structures per forward pass; lower it on GPU OOM
+    timeout_per_batch: 1800      # seconds
   resources:
-    role: gpu                   # maps to a partition in machine.yaml
+    role: gpu                    # gpu | cpu | bigmem | short | short_gpu  (roles in machine.yaml)
     gpus: 1
     time: "24:00:00"
 
@@ -102,116 +75,67 @@ generate:
 # SCREEN + DEDUP -- MLIP relaxation, then discard duplicates
 # ---------------------------------------------------------------------------
 screen:
-  mlip: mattersim               # mattersim | mace | uma
+  mlip: mattersim                # mattersim | chgnet
   mattersim:
     model: MatterSim-v1.0.0-5M.pth
-    fmax: 0.01                  # eV/A force convergence
-    max_steps: 500              # a cell still moving at this point is kept and
-                                # marked, not thrown away
-    batch_size: 32
+    fmax: 0.01                   # eV/A force convergence
+    max_steps: 500               # a cell still moving here is kept and marked
   dedup:
-    matcher:                    # pymatgen StructureMatcher tolerances
-      ltol: 0.2                 # fractional length
-      stol: 0.2                 # site displacement
-      angle_tol: 5.0            # degrees
-  resources: {role: gpu, gpus: 1, time: "24:00:00"}
+    matcher:                     # pymatgen StructureMatcher tolerances
+      ltol: 0.2                  # fractional length
+      stol: 0.2                  # site displacement
+      angle_tol: 5.0             # degrees
+  resources:
+    role: gpu                    # gpu | cpu | bigmem | short | short_gpu
+    gpus: 1
+    time: "24:00:00"
 
 # ---------------------------------------------------------------------------
 # REFERENCE -- the convex hull the candidates are measured against
 # ---------------------------------------------------------------------------
 reference:
-  functionals: [GGA]
-  thermo_type: GGA_GGA+U        # PINNED. Materials Project mixes functionals
-                                # silently; a reference set containing more
-                                # than one is refused rather than averaged.
-  energy_scale: raw             # raw | mp_corrected (MP's anion corrections)
-  mode: recompute               # mp_energies: take MP's numbers as they are
-                                # recompute: run the reference phases through
-                                #   OUR DFT so both sides of the hull share one
-                                #   absolute scale.  See D101 -- until this is
-                                #   wired, gate on the MLIP hull.
-  prescreen_mode: mp_energies   # what Phase A's cheap hull uses
-  prescreen_hull_max: 0.20      # eV/atom, deliberately wide for Phase A
-  snapshot: true                # freeze the MP query so the hull cannot move
-  snapshot_id: auto             # or a fixed id to reproduce an old run exactly
-  relax_with_mlip: true         # relax reference phases with the same MLIP, so
-                                # candidate and reference are treated alike
-# cache: $CSPFLOW_CACHE/mp      # default ~/.cache/cspflow. Left commented
-                                # because an undefined $VAR is a hard error
-                                # (D007), so writing it here would break the
-                                # campaign for anyone who has not exported it.
-
-# ---------------------------------------------------------------------------
-# CALIBRATE -- prove the cheap number predicts the expensive one
-# ---------------------------------------------------------------------------
-calibrate:
-  mp:                           # free: compares against MP's own DFT at FIXED
-                                # geometry. A sanity check, not the gate.
-    on_fail: warn               # warn | block
-    thresholds:
-      mae_e_per_atom: 0.05      # eV/atom
-      spearman_min: 0.90        # rank correlation -- the number that matters,
-                                # since filtering is a ranking decision
-      max_volume_drift: 0.05    # fractional
-  pilot:                        # costs DFT: OUR DFT on a sample. The real gate.
-    on_fail: block              # block: stop Phase B if the MLIP does not
-                                # predict our own DFT well enough
-    pilot_n: 40                 # structures to spend on the test
-    thresholds: {mae_e_per_atom: 0.05, mae_e_hull: 0.05, spearman_min: 0.90}
+  thermo_type: GGA_GGA+U         # GGA_GGA+U | R2SCAN | GGA_GGA+U_R2SCAN  -- PINNED
+  energy_scale: raw              # raw | mp_corrected
+  mode: recompute                # recompute | mp_energies  -- asked by `csp init`
+  energy_source: dft             # dft | mlip | mp  -- which store energy builds the FINAL hull
 
 # ---------------------------------------------------------------------------
 # FILTER -- who is worth a VASP job
 # ---------------------------------------------------------------------------
 filter:
-  e_above_hull_max: 0.10        # eV/atom. The single most consequential knob
-                                # in the file: it sets Phase B's size.
-  e_above_hull_max_source: calibrated   # calibrated: shift the cut by the
-                                # measured MLIP-vs-DFT offset | literal: use
-                                # the number above as written
-  max_per_composition: 5        # keep the field broad; without it one prolific
-                                # composition can fill the queue
+  e_above_hull_max: 0.10         # eV/atom on the MLIP hull; sets Phase B's size
+  max_per_composition: 5         # keeps one prolific composition from filling the queue
   spacegroup:
-    min_number: 1               # 1 = keep everything. 3 excludes P1 and P-1,
-                                # which are usually unrelaxed noise.
+    min_number: 1                # 1 keeps everything; 3 drops P1 and P-1
 
 # ---------------------------------------------------------------------------
-# DFT -- the expensive half. Tags and k-points are in recipe.yaml.
+# DFT -- the expensive half. INCAR tags and k-points are in recipe.yaml.
 # ---------------------------------------------------------------------------
 dft:
-  recipe: magnets               # shipped name, or a path: recipe.yaml
+  recipe: recipe.yaml            # this folder's copy | magnets | any path
+  layout: runs                   # runs | stages  (stages only for pre-2026-09-14 campaigns)
+  combined_job: true             # true | false  -- every step of a structure in one job
   potcar:
-    tree: VASP6.4               # VASP6.4 | VASP5.2
-    functional: PBE_64
-    overrides: {}               # element -> POTCAR symbol, e.g. {Sm: Sm_3}
+    tree: VASP6.4                # VASP6.4 | VASP5.2
+    functional: PBE_64           # the label matching the tree, e.g. PBE_54 for VASP5.2
+    overrides: {}                # several: {Sm: Sm_3, Ti: Ti_pv} -- element -> POTCAR symbol
   rare_earth:
-    f_treatment: frozen         # frozen: 4f in the core (Sm_3) -- tractable,
-                                # and one convention per campaign
-                                # valence: 4f in the valence, needs LDA+U
-    magnetic_order: ferri       # ferri | ferro | antiferro
-    reconstruct_ms: true        # add the frozen 4f moment back when reporting
+    f_treatment: frozen          # frozen | valence  (valence needs ldau)
+    magnetic_order: ferri        # ferri | ferro | none
+    reconstruct_ms: true         # true | false  -- add the frozen 4f moment back when reporting
   magnetism:
-    mode: ferrimagnetic_retm    # RE moment antiparallel to the TM sublattice
-    strict: true                # fail rather than let any site take a default
-                                # MAGMOM -- a silent default is a wrong answer
+    mode: ferrimagnetic_retm     # ferrimagnetic_retm | ferromagnetic | table | pymatgen | none
+    strict: true                 # true | false  -- fail rather than take a default MAGMOM
   ldau:
-    enabled: false              # true only with f_treatment: valence
-    ldau_type: 2
-    u: {}                       # element -> U in eV, e.g. {Sm: 6.0}
-    j: {}
-  nbands: auto                  # or an integer
-  incar_overrides: {}           # applied on top of every recipe step, e.g.
-                                # {NCORE: 8, LREAL: Auto}
-  max_in_flight: 200            # jobs queued at once
-  max_concurrent_tasks: 48
+    enabled: false               # true | false
+    ldau_type: 2                 # 1 | 2 | 4
+    u: {}                        # several: {Sm: 6.0, Nd: 6.0} -- element -> U in eV
+    j: {}                        # several: {Sm: 0.0, Nd: 0.0} -- element -> J in eV
+  nbands: auto                   # auto, or an integer
+  incar_overrides: {}            # several: {NCORE: 8, LREAL: Auto} -- on top of every recipe step
+  max_in_flight: 200             # jobs queued at once
+  max_concurrent_tasks: 48       # array tasks running at once
+  max_cores: 3200                # cores queued + running for this campaign; null = no cap
   select:
-    rank_by: e_above_hull_mlip  # the order Phase B spends the budget in
-    max_per_composition: 3
-    max_total: 1500
-    budget_core_hours: 200000   # Phase B stops here, mid-stream, cleanly
-
-# ---------------------------------------------------------------------------
-# ANALYZE
-# ---------------------------------------------------------------------------
-analyze:
-  properties: [m_dft_raw, m_s_reconstructed, volume, spacegroup]
-  report: html                  # html | none -- `csp report` writes report/
+    rank_by: e_above_hull_mlip   # the order Phase B spends the budget in
+    max_total: 1500              # LIFETIME ceiling on DFT jobs

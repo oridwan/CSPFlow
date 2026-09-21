@@ -11,9 +11,11 @@ bypass.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -23,6 +25,14 @@ from ase import Atoms
 from ase.db import connect as ase_connect
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+
+#: How long a write waits for another process's transaction, in ms (D144).
+#: Transactions are now batches rather than single rows, so the holder keeps the
+#: lock for seconds, not microseconds -- and a campaign is routinely run as TWO
+#: drivers, `-pre` and `-dft`, on one database (D129). At 30 s a second driver
+#: waiting on the first's reconcile raised `database is locked` and died; a
+#: background loop that waits a minute instead is harmless.
+BUSY_TIMEOUT_MS = 300_000
 SCHEMA_VERSION = "2"
 
 # ASE key_value_pairs accept only these.  A list, dict or None raises
@@ -39,6 +49,11 @@ try:                                                     # pragma: no cover - AS
     from ase.db.core import reserved_keys as _ASE_RESERVED
 except ImportError:                                      # pragma: no cover
     _ASE_RESERVED = frozenset()
+
+# ASE refuses a string key_value_pair that int() or float() would parse, because it
+# would come back out of the database as a number. Mirrors ASE's own
+# str_represents() check in ase/db/core.py.
+_NUMBER_LIKE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$|^(True|False)$")
 
 
 class StoreError(Exception):
@@ -104,6 +119,17 @@ def _clean_kv(kv: dict[str, Any]) -> dict[str, Any]:
                 f"str/int/float/bool; put structured values in the `data=` blob instead "
                 f"(they round-trip, but are not queryable)."
             )
+        if isinstance(value, str) and _NUMBER_LIKE.match(value):
+            raise StoreError(
+                f"key {key!r} holds {value!r}, which ASE will not store: it refuses "
+                f"any string key_value_pair that int() or float() would parse, "
+                f"because the value would come back out as a number. This bites "
+                f"hash-like values -- a bare 16-character hex digest is number-like "
+                f"about once in 600 (all digits, or digits-e-digits) -- so prefix "
+                f"them with what they are, e.g. 'sha256:{value}', which cannot parse "
+                f"as a number by construction. Caught here so the message names the "
+                f"key; ASE's own error names only the value."
+            )
         if key in _ASE_RESERVED:
             raise StoreError(
                 f"key {key!r} is reserved by ASE (it reserves every element symbol "
@@ -147,33 +173,365 @@ def _git_sha(repo: Path | None = None) -> str:
         return ""
 
 
+# Filesystems where SQLite's WAL mode is unsafe.  WAL keeps its index in a
+# shared-memory file (`-shm`) that every connection mmaps; a network filesystem
+# provides no coherent shared memory, and SQLite's own documentation says WAL
+# "does not work" there.  It does not fail loudly -- it corrupts.
+#
+# Measured here 2026-09-12: the CePdGe campaign database on
+# aqu-fs10:/exports/... (nfs4) went from working at cycle 3 to
+# `DatabaseError: file is not a database` at cycle 4.  2,560,000 bytes intact on
+# disk, page 1 overwritten with a leaf-page header, `sqlite3 .recover` unable to
+# open it at all.  The exposure is wider than one driver: `Store` holds TWO
+# independent connections to the file (its own `sqlite3` and a fresh
+# `ase_connect` per operation), and a campaign is routinely touched from the
+# login node by `csp status` while its driver runs on a compute node -- two NFS
+# clients, one file, no shared memory between them.
+_NETWORK_FS = frozenset({
+    "nfs", "nfs4", "cifs", "smb2", "smb3", "lustre", "gpfs", "beegfs",
+    "afs", "ceph", "fuse.sshfs", "fuse.glusterfs", "9p",
+})
+
+
+def _filesystem_type(path: Path) -> str:
+    """The fstype of the filesystem holding `path` ('' if it cannot be told)."""
+    try:
+        target = path.resolve()
+        if not target.exists():
+            target = target.parent
+        best, kind = "", ""
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount, fstype = parts[1], parts[2]
+                if (str(target) == mount or str(target).startswith(mount.rstrip("/") + "/")) \
+                        and len(mount) > len(best):
+                    best, kind = mount, fstype
+        return kind
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
+def journal_mode_for(path: Path) -> str:
+    """WAL on a local disk, a rollback journal on a network one.
+
+    TRUNCATE rather than DELETE because it rewrites one existing file instead of
+    creating and unlinking one per transaction, which is markedly less work over
+    NFS -- and unlike WAL it uses only POSIX locks, which NFSv4 does provide.
+    """
+    return "TRUNCATE" if _filesystem_type(path) in _NETWORK_FS else "WAL"
+
+
+# SQLite primary result codes that mean "the storage blinked", as opposed to
+# "the file has rotted". The distinction is the whole point: one is waited out,
+# the other is fatal, and until D148 both raised `sqlite3.DatabaseError` and
+# were handled as if they were the second.
+_SQLITE_BUSY, _SQLITE_IOERR, _SQLITE_CANTOPEN = 5, 10, 14
+_SQLITE_CORRUPT, _SQLITE_NOTADB = 11, 26
+
+#: Matched against the message text, because `sqlite3.Error.sqlite_errorcode`
+#: only exists on Python 3.11+ and the `cspflow` env runs 3.10. Checked in
+#: full-lowercase against the message SQLite itself produces.
+_TRANSIENT_TEXT = (
+    "disk i/o error",                # SQLITE_IOERR
+    "unable to open database file",  # SQLITE_CANTOPEN
+    "database is locked",            # SQLITE_BUSY escaping the busy timeout
+    "database table is locked",
+)
+_FATAL_TEXT = (
+    "file is not a database",
+    "database disk image is malformed",
+    "malformed database schema",
+)
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True when a database error is the storage blinking, not the file rotting.
+
+    `/scratch` is NFSv4 with `local_lock=none`, so every lock lives on the
+    server. A `hard` mount makes reads and writes block and retry forever, which
+    is why it is easy to assume the driver is safe -- but `hard` says nothing
+    about LOCK state. When a lease expires during an outage the client cannot
+    reclaim its locks and the next operation returns EIO, which SQLite reports
+    as `SQLITE_IOERR`, whose message text is the bare string "disk I/O error".
+
+    Measured 2026-09-19: aqu-fs10 went unresponsive 17:25:10-17:28:53 and the
+    RE-magnets-CHGNet driver exited at 17:30:43, at cycle 32 of a healthy run.
+    The database was untouched -- `PRAGMA integrity_check` returned `ok` and the
+    file's MD5 was unchanged -- but 36 DFT jobs then completed over the next
+    three hours with no driver alive to reconcile them.
+
+    Note that `PRAGMA busy_timeout` is NOT protection here despite being set to
+    five minutes: SQLite invokes the busy handler only for SQLITE_BUSY on lock
+    contention, and never for SQLITE_IOERR.
+    """
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:                                   # Python 3.11+
+        primary = int(code) & 0xFF
+        if primary in (_SQLITE_CORRUPT, _SQLITE_NOTADB):
+            return False
+        return primary in (_SQLITE_BUSY, _SQLITE_IOERR, _SQLITE_CANTOPEN)
+    text = str(exc).strip().lower()
+    # Fatal wins over transient: a corrupt file must never be retried into
+    # looking like a network problem.
+    if any(t in text for t in _FATAL_TEXT):
+        return False
+    return any(t in text for t in _TRANSIENT_TEXT)
+
+
+def _no_schema_message(path: Path) -> str:
+    """Why an existing database can read back as empty, and what to do.
+
+    Almost always this is not a broken file. It is a WAL database being read
+    from a DIFFERENT MACHINE than the one holding it: the `-wal` file carries
+    every recent write and its index lives in `-shm`, which is shared memory and
+    coherent only within one host. A second NFS client sees the stale main file
+    instead -- which, for a campaign whose whole history is still in the WAL,
+    has no schema_version in it.
+
+    Seen 2026-09-12: `csp status` on str-c6 against a CeFeB database whose
+    driver held it on str-c221. Main file two hours stale, `-wal` 4.2 MB and
+    thirty seconds old. The campaign itself was untouched and still running.
+    """
+    wal = Path(str(path) + "-wal")
+    lines = [f"{path} did not read back as a cspflow database (no schema_version)."]
+    if wal.is_file() and wal.stat().st_size:
+        main_age = path.stat().st_mtime
+        wal_age = wal.stat().st_mtime
+        lines += [
+            f"  A write-ahead log is present and holds {wal.stat().st_size:,} bytes"
+            f" of newer data:",
+            f"      {path.name}      last written {_when(main_age)}",
+            f"      {wal.name}  last written {_when(wal_age)}",
+            "  That almost always means this database is open on ANOTHER NODE and you",
+            "  are reading it from this one. WAL needs shared memory, which a network",
+            "  filesystem cannot provide between hosts, so you are seeing the stale",
+            "  main file rather than the live campaign.",
+            "  Your data is fine. Read it from the node holding it (`squeue` shows",
+            "  which), or read the driver's status.json, or wait for the driver to",
+            "  finish and checkpoint.",
+        ]
+    else:
+        lines.append("  The file exists but carries no cspflow schema. If it was created"
+                     " by something else, move it aside and re-run the campaign.")
+    return "\n".join(lines)
+
+
+def _when(stamp: float) -> str:
+    import time as _time
+
+    return _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(stamp))
+
+
+def wal_lag(path: Path) -> float | None:
+    """Seconds by which a non-empty `-wal` is newer than the main database.
+
+    `None` means there is nothing to worry about: no WAL, an empty one, or a
+    main file at least as new.
+
+    This is the check that separates "I can read this database" from "I can read
+    the CURRENT database", and only the second one is worth anything. On a
+    network filesystem the `-shm` index that makes a WAL readable is coherent
+    only within one host, so a second node reads the main file as it stood at
+    the last checkpoint. That read SUCCEEDS -- it simply answers with an old
+    campaign. A silently stale answer is worse than an error, because nothing
+    about it looks wrong: `csp status` prints a clean table of numbers that
+    stopped being true hours ago.
+
+    Both failure shapes come from the same cause, so both are detected here:
+      * schema_version missing entirely -> `Store.open` raises (see
+        `_no_schema_message`), which happens when the campaign is young enough
+        that even its schema is still in the WAL;
+      * schema_version present but everything after it stale -> no exception at
+        all, and this function is the only thing that catches it.
+    """
+    wal = Path(f"{path}-wal")
+    try:
+        if not path.is_file() or not wal.is_file() or wal.stat().st_size == 0:
+            return None
+        lag = wal.stat().st_mtime - path.stat().st_mtime
+    except OSError:
+        return None
+    return lag if lag > 0 else None
+
+
+def _external_tables_once(db) -> None:
+    """Stop ASE querying its external-table list once PER ROW it returns.
+
+    `SQLite3Database._convert_tuple_to_row` calls `_get_external_table_names()`
+    for every row of every `select()` -- one extra query per structure, 1.3 ms
+    each on nfs4, 19 of the 22 seconds it took to read 14,752 screened
+    structures even on one connection (D144).
+
+    cspflow never creates ASE external tables: `_clean_kv` refuses the dict an
+    `external_tables=` value would need. So the list is read once and reused. A
+    guard, not an assumption -- if a future ASE renames the method, this does
+    nothing and reads are merely slower.
+    """
+    getter = getattr(db, "_get_external_table_names", None)
+    if getter is None:
+        return
+    try:
+        names = list(getter())
+    except Exception:                                          # noqa: BLE001
+        return
+    db._get_external_table_names = lambda db_con=None: list(names)
+
+
 class Store:
     """A campaign database."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._sql: sqlite3.Connection | None = None
+        self._ase = None
+        # Depth of `transaction()` blocks. While > 0, writes accumulate and
+        # nothing commits until the outermost block exits (D144).
+        self._tx_depth = 0
+        # The mode actually in force, filled in when the connection opens. It
+        # is not always the mode we asked for -- see `_set_journal_mode`.
+        self.journal_mode: str = ""
 
     # -- lifecycle ---------------------------------------------------------
 
     @property
     def sql(self) -> sqlite3.Connection:
         if self._sql is None:
-            self._sql = sqlite3.connect(str(self.path), timeout=30.0)
+            self._sql = sqlite3.connect(str(self.path), timeout=BUSY_TIMEOUT_MS / 1000)
             self._sql.row_factory = sqlite3.Row
-            self._sql.execute("PRAGMA journal_mode=WAL")
+            self._sql.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            want = journal_mode_for(self.path)
+            self.journal_mode = self._set_journal_mode(want)
             self._sql.execute("PRAGMA foreign_keys=ON")
-            self._sql.execute("PRAGMA busy_timeout=30000")
+            # On a network filesystem the rollback journal is only as safe as
+            # the flushes behind it, so do not let the OS reorder them.
+            if self.journal_mode.upper() != "WAL":
+                self._sql.execute("PRAGMA synchronous=FULL")
+            # 64 MB of page cache, held for the life of the Store. On NFS every
+            # page SQLite has to re-read is a network round trip; with ASE on
+            # this one connection (D144) the cache now survives between
+            # operations instead of being thrown away with each connection.
+            # It also keeps a large transaction from spilling to disk part-way,
+            # which would take the EXCLUSIVE lock early and block readers.
+            self._sql.execute("PRAGMA cache_size=-65536")
         return self._sql
+
+    def _set_journal_mode(self, want: str) -> str:
+        """Ask for a journal mode; report what was actually granted.
+
+        Asking is not getting, and `PRAGMA journal_mode` is the worst kind of
+        API for that: the mode is persisted in the database header, and SQLite
+        will not change it while any other connection has the file open. What
+        happens then is version- and timing-dependent -- it either returns the
+        OLD mode as an ordinary result row, with no exception, or it raises
+        `database is locked`. Executing the pragma and ignoring both is how the
+        CeFeB and CePdGe campaigns stayed in WAL on NFS after the guard that was
+        supposed to prevent exactly that had already been added: the driver had
+        the file open, so every later connection's request was declined in
+        silence.
+
+        So return the granted mode rather than the requested one, and never let
+        a declined request raise. A reader that cannot switch the mode can still
+        read; refusing to open at all would take away the last way to see a
+        campaign whose driver is holding it.
+        """
+        try:
+            row = self._sql.execute(f"PRAGMA journal_mode={want}").fetchone()
+            got = (row[0] if row else want) or want
+        except sqlite3.OperationalError:
+            # Declined by a concurrent holder. Read the mode in force instead.
+            try:
+                row = self._sql.execute("PRAGMA journal_mode").fetchone()
+                got = (row[0] if row else "") or "unknown"
+            except sqlite3.OperationalError:
+                got = "unknown"
+        return str(got)
 
     @property
     def ase(self):
-        """A fresh ASE connection.
+        """ASE's view of this database, running on this Store's OWN connection.
 
-        ASE opens and closes per operation; holding one open across a long stage
-        would keep a write lock that the array workers then block on.
+        D144 replaced D015 ("a fresh ASE connection per operation"). That rule
+        protected array workers from a driver's write lock, and D056 has since
+        made workers read-only, so it was paying for a hazard that no longer
+        exists -- at a cost measured on RE-magnets-CHGNet (14,752 structures,
+        nfs4):
+
+        * `select()` opened a NEW sqlite connection for EVERY ROW it returned
+          (ASE looks up its external-table names per row, and outside a
+          `with db:` block each lookup connects afresh): 14,753 connections
+          and 59 s to read the screened set, against 22 s on one connection.
+        * every `update()` was two connections, a lock file, and a commit with
+          `synchronous=FULL`: 702 ms per structure.
+        * two connections in one process deadlock under a rollback journal the
+          moment one holds a write while the other wants one -- which is why
+          `legacy.py` needed a load-bearing `gc.collect()`.
+
+        So ASE is handed `self.sql`: one process, one connection, one
+        transaction scope shared by the SQL tables and the structure rows.
+
+        `use_lock_file=False`: ASE's lock file is a second, file-based lock on
+        top of SQLite's own, acquired with `timeout=inf` and doubling back-off.
+        A process killed while holding it left `campaign.db.lock` behind and
+        every later open waited forever in silence (2026-09-15). SQLite's POSIX
+        locks, which NFSv4 provides, are released when the process dies.
+
+        On a shared connection ASE commits by itself only every 5,000
+        operations, so every write wrapper below commits through `_commit()`,
+        which defers to an enclosing `transaction()`.
         """
-        return ase_connect(str(self.path), serial=True)
+        if self._ase is None:
+            db = ase_connect(str(self.path), serial=True, use_lock_file=False)
+            db.connection = self.sql
+            db.change_count = 0
+            _external_tables_once(db)
+            self._ase = db
+        return self._ase
+
+    @contextmanager
+    def transaction(self) -> Iterator["Store"]:
+        """Commit everything written inside the block once, or none of it.
+
+        Two reasons, and they are separate. SPEED: on NFS a commit is an fsync
+        round trip, and per-structure loops of them were most of a nine-hour
+        reconcile. ATOMICITY: a finished job's state and the results folded
+        from it now land together, so a driver killed half-way leaves the job
+        un-reconciled -- and it is reconciled again next cycle -- instead of
+        `done` with half its results written.
+
+        Nesting is by depth: only the outermost block commits or rolls back. An
+        exception that escapes the outermost block rolls everything back and
+        propagates; one caught INSIDE the block does not undo writes made before
+        it, exactly as the per-write commits it replaces did not.
+        """
+        self._tx_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._tx_depth -= 1
+            if self._tx_depth == 0:
+                self.sql.rollback()
+            raise
+        self._tx_depth -= 1
+        if self._tx_depth == 0:
+            self.sql.commit()
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._tx_depth > 0
+
+    def _commit(self) -> None:
+        """Commit now, unless an enclosing `transaction()` will."""
+        if self._tx_depth == 0:
+            self.sql.commit()
+
+    def commit(self) -> None:
+        """`_commit` for callers outside this module that run raw SQL."""
+        self._commit()
 
     @staticmethod
     def _check_sidecars(path: Path) -> None:
@@ -209,11 +567,86 @@ class Store:
         # Touch the ASE side so both halves exist from the start; otherwise the
         # first structure write creates ASE's tables at an arbitrary later time.
         _ = store.ase.count()
+        store._add_missing_indices()
         store.set_meta("schema_version", SCHEMA_VERSION)
         store.set_meta("campaign", campaign)
         store.set_meta("config_hash", config_hash)
         store.sql.commit()
         return store
+
+    #: Columns added after the schema version was first stamped. Each is
+    #: additive with a default, so an older cspflow reading the same file is
+    #: unaffected -- `SELECT *` simply returns one more column.
+    #:
+    #: They are applied rather than version-bumped because `open()` REFUSES a
+    #: version mismatch ("migration is required; refusing to guess"), and a bump
+    #: would lock every existing campaign out of its own database. A 14,755
+    #: structure campaign is not worth losing to a bookkeeping column.
+    _LATE_COLUMNS = (
+        ("job", "cores", "INTEGER NOT NULL DEFAULT 0"),
+    )
+
+    def _add_missing_columns(self) -> None:
+        """Add any `_LATE_COLUMNS` this file does not have yet. Idempotent."""
+        for table, column, decl in self._LATE_COLUMNS:
+            try:
+                have = {r[1] for r in self.sql.execute(f"PRAGMA table_info({table})")}
+                if column not in have:
+                    self.sql.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                    self.sql.commit()
+            except Exception:                                  # noqa: BLE001
+                pass
+
+    #: Indexes ASE's own schema lacks (D144). ASE indexes its key-value tables
+    #: by KEY only, but every `update()` begins `DELETE FROM <table> WHERE id
+    #: IN (...)` on keys, text_key_values and number_key_values -- and a write
+    #: with atoms does species too. Without an index on `id` each is a full
+    #: table scan, so one structure update scanned every key-value row in the
+    #: campaign, and got slower as the campaign grew: 702 ms on nfs4 at 14,752
+    #: structures, 46 ms with these. Additive, like `_LATE_COLUMNS`, and for the
+    #: same reason: a version bump would lock existing campaigns out.
+    _LATE_INDICES = (
+        ("ix_ase_keys_id", "keys", "id"),
+        ("ix_ase_text_id", "text_key_values", "id"),
+        ("ix_ase_number_id", "number_key_values", "id"),
+        ("ix_ase_species_id", "species", "id"),
+    )
+
+    def _add_missing_indices(self) -> None:
+        """Create any `_LATE_INDICES` that are missing. Idempotent, never fatal.
+
+        Reads `sqlite_master` first, so opening an already-indexed database
+        never asks for a write lock. When one IS missing and another process
+        holds the file, give up after two seconds rather than thirty: the next
+        open tries again, and `csp status` must not stall behind a busy driver
+        in order to add an index.
+        """
+        try:
+            have = {r[0] for r in self.sql.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'")}
+            tables = {r[0] for r in self.sql.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        except Exception:                                      # noqa: BLE001
+            return
+        missing = [(n, t, c) for n, t, c in self._LATE_INDICES
+                   if n not in have and t in tables]
+        if not missing:
+            return
+        try:
+            self.sql.execute("PRAGMA busy_timeout=2000")
+            for name, table, column in missing:
+                self.sql.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({column})")
+            self.sql.commit()
+        except Exception:                                      # noqa: BLE001
+            try:
+                self.sql.rollback()
+            except Exception:                                  # noqa: BLE001
+                pass
+        finally:
+            try:
+                self.sql.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            except Exception:                                  # noqa: BLE001
+                pass
 
     @classmethod
     def open(cls, path: str | Path) -> "Store":
@@ -222,9 +655,11 @@ class Store:
         if not path.is_file():
             raise StoreError(f"no campaign database at {path}. Run `csp init` first.")
         store = cls(path)
+        store._add_missing_columns()
+        store._add_missing_indices()
         found = store.meta("schema_version")
         if found is None:
-            raise StoreError(f"{path} is not a cspflow database (no schema_version).")
+            raise StoreError(_no_schema_message(path))
         if found != SCHEMA_VERSION:
             raise StoreError(
                 f"{path} has schema version {found}, this cspflow expects "
@@ -233,10 +668,35 @@ class Store:
         return store
 
     def close(self) -> None:
+        self._ase = None
         if self._sql is not None:
             self._sql.commit()
             self._sql.close()
             self._sql = None
+
+    def reconnect(self) -> None:
+        """Drop the connection so the next use opens a fresh one.
+
+        Deliberately NOT `close()`: that commits first, and the whole reason to
+        reconnect is that the storage just refused a write. Committing would
+        either fail again or, worse, half-apply. Anything uncommitted is
+        discarded on purpose -- the caller's contract is that it re-runs the
+        work, and a cycle is built to be re-runnable (D148).
+
+        The ASE handle goes too. It rides on this same connection (D144), so a
+        stale one would keep the dead file descriptor alive.
+        """
+        self._ase = None
+        if self._sql is not None:
+            try:
+                self._sql.close()
+            except sqlite3.Error:
+                # The connection is being thrown away; a failure to close it
+                # cleanly is not worth propagating over the original error.
+                pass
+            self._sql = None
+        self._tx_depth = 0
+        self.journal_mode = ""
 
     def __enter__(self) -> "Store":
         return self
@@ -252,7 +712,7 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)),
         )
-        self.sql.commit()
+        self._commit()
 
     def meta(self, key: str) -> str | None:
         """Read campaign metadata.
@@ -283,13 +743,35 @@ class Store:
     ) -> int:
         kv["origin"] = origin.value if isinstance(origin, Origin) else origin
         kv["state"] = state.value if isinstance(state, StructureState) else state
-        return int(self.ase.write(atoms, data=data or {}, **_clean_kv(kv)))
+        sid = int(self.ase.write(atoms, data=data or {}, **_clean_kv(kv)))
+        self._commit()
+        return sid
 
-    def update_structure(self, sid: int, *, data: dict[str, Any] | None = None, **kv: Any) -> None:
+    def update_structure(self, sid: int, *, data: dict[str, Any] | None = None,
+                         delete_keys: list[str] | None = None, **kv: Any) -> None:
+        extra: dict[str, Any] = {}
         if data is not None:
-            self.ase.update(sid, data=data, **_clean_kv(kv))
-        else:
-            self.ase.update(sid, **_clean_kv(kv))
+            extra["data"] = data
+        if delete_keys:
+            extra["delete_keys"] = list(delete_keys)
+        self.ase.update(sid, **extra, **_clean_kv(kv))
+        self._commit()
+
+    def replace_geometry(self, sid: int, atoms) -> None:
+        """Replace a row's CELL AND POSITIONS, keeping its id and its key-values.
+
+        Used when the MLIP relaxation finishes: the relaxed cell is a far better
+        starting point for the DFT relax than the seed as supplied, and until
+        2026-09-12 it was discarded -- the worker recorded the energy and threw
+        the geometry away, so `dft_stage` step 0 ran on the unrelaxed structure.
+        The same defect at step > 0 had already been found and fixed there, with
+        volumes measured 176.15 vs 179.03 A^3 before and after.
+
+        The id is preserved because every claim, filter event and hull placement
+        refers to it.
+        """
+        self.ase.update(sid, atoms=atoms)
+        self._commit()
 
     def get_structure(self, sid: int):
         try:
@@ -305,6 +787,51 @@ class Store:
 
     def structure_ids(self, selection: str | None = None, **kwargs: Any) -> list[int]:
         return [int(r.id) for r in self.ase.select(selection, **kwargs)]
+
+    def unplaced_mlip_candidates(self) -> int:
+        """Screened structures with an MLIP energy and no MLIP hull placement.
+
+        Plain SQL on ASE's key-value tables rather than `select()`, because this
+        is asked on every driver cycle and the answer is a count (D144). A
+        structure whose system could not be hulled carries `hull_error` and is
+        not counted: counting it made the stage "pending" forever, so it re-ran
+        a full placement every cycle and the driver never went idle.
+        """
+        row = self.sql.execute(
+            "SELECT COUNT(*) FROM text_key_values s "
+            "WHERE s.key='state' AND s.value=? "
+            "  AND EXISTS (SELECT 1 FROM number_key_values e "
+            "              WHERE e.id=s.id AND e.key='mlip_e_per_atom') "
+            "  AND NOT EXISTS (SELECT 1 FROM hull h "
+            "                  WHERE h.structure_id=s.id AND h.hull_type='mlip') "
+            "  AND NOT EXISTS (SELECT 1 FROM keys k "
+            "                  WHERE k.id=s.id AND k.key='hull_error')",
+            (StructureState.screened.value,)).fetchone()
+        return int(row[0] or 0)
+
+    def count_in_state_lacking(self, state: StructureState | str, key: str) -> int:
+        """Structures in `state` that do not carry `key` -- a count, in SQL.
+
+        For per-cycle "is there work?" questions (D144). Answering them with
+        `select()` read and decoded every structure in the state just to count
+        the ones missing a flag: 59 s per ask on nfs4 at 14,752 structures,
+        asked every cycle.
+        """
+        value = state.value if isinstance(state, StructureState) else state
+        row = self.sql.execute(
+            "SELECT COUNT(*) FROM text_key_values s "
+            "WHERE s.key='state' AND s.value=? "
+            "  AND NOT EXISTS (SELECT 1 FROM keys k WHERE k.id=s.id AND k.key=?)",
+            (value, key)).fetchone()
+        return int(row[0] or 0)
+
+    def mlip_hull_hashes(self) -> dict[int, set[str]]:
+        """structure id -> every reference-set hash it has been placed against."""
+        out: dict[int, set[str]] = {}
+        for sid, ref in self.sql.execute(
+                "SELECT structure_id, ref_set_hash FROM hull WHERE hull_type='mlip'"):
+            out.setdefault(int(sid), set()).add(str(ref))
+        return out
 
     def set_structure_state(self, sid: int, state: StructureState | str, **kv: Any) -> None:
         self.update_structure(sid, state=state, **kv)
@@ -331,7 +858,7 @@ class Store:
             "  n_target=excluded.n_target, n_atoms=excluded.n_atoms",
             (formula, chemsys, z, n_atoms, n_target, source_mode, source_name, state),
         )
-        self.sql.commit()
+        self._commit()
         if cur.lastrowid:
             return int(cur.lastrowid)
         row = self.sql.execute(
@@ -379,7 +906,7 @@ class Store:
             self.sql.execute(
                 "UPDATE composition SET state=?, fail_reason=?, n_produced=? WHERE id=?",
                 (state, fail_reason, int(n_produced), cid))
-        self.sql.commit()
+        self._commit()
 
     def generation_yield(self) -> dict[str, int]:
         """Requested versus produced across every composition that has run.
@@ -420,7 +947,7 @@ class Store:
             "VALUES (?,?,?,?,?,?)",
             (config_hash, settings_hash, git_sha, code_version, machine, blob),
         )
-        self.sql.commit()
+        self._commit()
         row = self.sql.execute(
             "SELECT id FROM provenance WHERE config_hash=? AND settings_hash=? AND git_sha=?",
             (config_hash, settings_hash, git_sha),
@@ -456,7 +983,7 @@ class Store:
             (structure_id, hull_type, energy_scale, e_above_hull, formation_energy,
              ref_set_hash, settings_hash),
         )
-        self.sql.commit()
+        self._commit()
         return int(cur.lastrowid or 0)
 
     def assert_hull_consistent(self, ref_set_hash: str) -> None:
@@ -503,7 +1030,7 @@ class Store:
             + ", ".join(f"{c}=excluded.{c}" for c in present if c != "mp_id")
         )
         self.sql.execute(sql, [fields[c] for c in present])
-        self.sql.commit()
+        self._commit()
         row = self.sql.execute(
             "SELECT id FROM reference_entry WHERE mp_id=? AND thermo_type=? AND snapshot_id=?",
             (fields["mp_id"], fields["thermo_type"], fields.get("snapshot_id", "")),
@@ -538,7 +1065,7 @@ class Store:
         assignments = ", ".join(f"{k}=?" for k in fields)
         self.sql.execute(f"UPDATE reference_entry SET {assignments} WHERE id=?",
                          [*fields.values(), entry_id])
-        self.sql.commit()
+        self._commit()
 
     def reference_entries(
         self, *, chemsys: str | None = None, include_subsystems: bool = False
@@ -596,19 +1123,20 @@ class Store:
 
     def add_job(self, *, stage: str, structure_id: int | None = None,
                 recipe_step: str = "", workdir: str = "",
-                provenance_id: int | None = None) -> int:
+                provenance_id: int | None = None, cores: int = 0) -> int:
         cur = self.sql.execute(
-            "INSERT INTO job (structure_id, stage, recipe_step, workdir, provenance_id) "
-            "VALUES (?,?,?,?,?)",
-            (structure_id, stage, recipe_step, workdir, provenance_id),
+            "INSERT INTO job (structure_id, stage, recipe_step, workdir, "
+            "provenance_id, cores) VALUES (?,?,?,?,?,?)",
+            (structure_id, stage, recipe_step, workdir, provenance_id, int(cores)),
         )
-        self.sql.commit()
+        self._commit()
         return int(cur.lastrowid or 0)
 
     def update_job(self, job_id: int, **fields: Any) -> None:
         allowed = {
             "slurm_id", "array_task_id", "state", "attempt", "workdir",
             "core_hours", "exit_reason", "remedy", "submitted_at", "finished_at",
+            "cores",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -617,7 +1145,7 @@ class Store:
             return
         sets = ", ".join(f"{k}=?" for k in fields)
         self.sql.execute(f"UPDATE job SET {sets} WHERE id=?", [*fields.values(), job_id])
-        self.sql.commit()
+        self._commit()
 
     def orphan_jobs(self) -> int:
         """Job rows written but never stamped with a scheduler id.
@@ -685,7 +1213,7 @@ class Store:
             "VALUES (?,?,?,?,?,?)",
             (structure_id, gate, int(passed), value, threshold, detail),
         )
-        self.sql.commit()
+        self._commit()
 
     def filter_events(self, structure_id: int) -> list[sqlite3.Row]:
         return list(self.sql.execute(
@@ -700,7 +1228,7 @@ class Store:
             "  value=excluded.value, text_value=excluded.text_value",
             (structure_id, key, value, text_value, source),
         )
-        self.sql.commit()
+        self._commit()
 
     def properties(self, structure_id: int) -> list[sqlite3.Row]:
         return list(self.sql.execute(
@@ -719,7 +1247,7 @@ class Store:
             f"INSERT INTO calibration ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
             vals,
         )
-        self.sql.commit()
+        self._commit()
         return int(cur.lastrowid or 0)
 
     def latest_calibration(self, kind: str) -> sqlite3.Row | None:
@@ -740,7 +1268,7 @@ class Store:
             (structure_id, engine, energy, e_per_atom, int(converged), n_steps,
              volume_before, volume_after, provenance_id),
         )
-        self.sql.commit()
+        self._commit()
         return int(cur.lastrowid or 0)
 
     # -- summary -----------------------------------------------------------
@@ -765,18 +1293,48 @@ class Store:
         }
 
     def relaxation_outcomes(self) -> dict[str, int]:
-        """Converged vs. not, per engine -- never folded into a single "done".
+        """Converged vs. not, per engine, counted in STRUCTURES -- never folded
+        into a single "done".
 
         This is D027 surfaced where a user will actually see it. Over 106 jobs
         in `redo-new-ter-mag`, 100% exited cleanly and only 39% reached required
         accuracy; a status line reading "106 done" describes the process
         faithfully and the science not at all.
+
+        **Counted in structures, not rows (D134).** `relaxation` is append-only
+        attempt history: a structure that hits the ionic step limit, is retried
+        from CONTCAR and then converges holds TWO rows, one of each kind. The
+        original `COUNT(*)` reported both, so CePdGe read
+
+            vasp:relax:converged      157
+            vasp:relax:not converged   34   <- not usable as a relaxed geometry
+
+        while `campaign_audit.py` found nothing wrong. Neither was lying. Those
+        34 rows were 30 structures (4 had failed twice), of which 6 had SINCE
+        converged and were `dft_done`. Only 24 structures actually lacked a
+        converged relax, and every one was already re-running.
+
+        A count of failed attempts is not a count of broken structures, and the
+        line is read as the second. So a structure counts as converged if it has
+        any converged record for that engine -- a later success supersedes an
+        earlier failure -- and `:retried` reports how many got there the hard
+        way, because those attempts cost core-hours and are worth seeing.
         """
         out: dict[str, int] = {}
         for row in self.sql.execute(
-            "SELECT engine, converged, COUNT(*) n FROM relaxation "
-            "GROUP BY engine, converged ORDER BY engine"
+            "SELECT engine, "
+            "       COUNT(DISTINCT structure_id) AS seen, "
+            "       COUNT(DISTINCT CASE WHEN converged THEN structure_id END) AS ok, "
+            "       COUNT(DISTINCT CASE WHEN NOT converged THEN structure_id END) AS failed "
+            "FROM relaxation GROUP BY engine ORDER BY engine"
         ):
-            key = f"{row['engine']}:{'converged' if row['converged'] else 'not converged'}"
-            out[key] = row["n"]
+            engine, seen, ok = row["engine"], row["seen"], row["ok"]
+            if ok:
+                out[f"{engine}:converged"] = ok
+            if seen - ok:
+                out[f"{engine}:not converged"] = seen - ok
+            # Inclusion-exclusion: in both sets = |ok| + |failed| - |union|.
+            retried = ok + row["failed"] - seen
+            if retried:
+                out[f"{engine}:retried"] = retried
         return out

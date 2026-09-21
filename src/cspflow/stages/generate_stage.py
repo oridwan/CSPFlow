@@ -50,6 +50,17 @@ DEFAULT_GROUP = 20
 CLAIMABLE = "new"
 
 
+
+def _results_path(workdir: Path, tag: str, index: int) -> Path:
+    """Where task `index` wrote its results: the D136 layout, else the old flat
+    one. A results file that cannot be found fails a whole batch, so the old
+    location is still read long after it stopped being written."""
+    current = workdir / "batches" / tag / f"results-task{index}.json"
+    if current.is_file():
+        return current
+    legacy = workdir / f"{tag}.task{index}.json"
+    return legacy if legacy.is_file() else current
+
 class GenerateStage:
     name = "generate"
     role = "gpu"
@@ -133,8 +144,18 @@ class GenerateStage:
         workdir = workdir.resolve()
         workdir.mkdir(parents=True, exist_ok=True)
         tag = items[0].key
+        # Every task's results are named after this one tag, so each item has to
+        # carry it: by reconcile time an item may arrive alone, and its own key
+        # names a file the worker never wrote (D121).
+        for item in items:
+            item.group_key = tag
         block = self.cfg.campaign.generate
-        manifest = workdir / f"{tag}.manifest.json"
+        # One directory per submission (D136), matching the screen stage. The
+        # worker derives every path it writes from the manifest's parent, so
+        # this moves the results and the outputs here too.
+        batch_dir = workdir / "batches" / tag
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        manifest = batch_dir / "inputs.json"
         manifest.write_text(json.dumps({
             "key": tag,
             "db": str(self.cfg.campaign_db.resolve()),
@@ -148,7 +169,7 @@ class GenerateStage:
 
         resources = block.resources
         return JobSpec(
-            name=tag, stage=self.name, workdir=workdir,
+            name=tag, stage=self.name, workdir=batch_dir,
             command=f"csp generate-worker --manifest {manifest}",
             role=self.role, ntasks=resources.ntasks or 1,
             cpus_per_task=resources.cpus_per_task or 8,
@@ -163,8 +184,10 @@ class GenerateStage:
     def reconcile(self, store: Store, job_row: Any, status: JobStatus,
                   items: list[WorkItem]) -> None:
         workdir = Path(job_row["workdir"])
-        for index, item in enumerate(items):
-            results_file = workdir / f"{item.key}.task{index}.json"
+        for position, item in enumerate(items):
+            index = item.task_index if item.task_index is not None else position
+            tag = item.group_key or item.key
+            results_file = _results_path(workdir, tag, index)
             if not results_file.is_file():
                 for cid in item.composition_ids:
                     store.set_composition_state(
@@ -191,14 +214,33 @@ class GenerateStage:
                     f"{path} is not there", n_produced=0)
                 continue
 
+            # The composition-keyed record, beside the campaign database rather
+            # than inside it (D141). `campaign.db` is a cache; this is what it
+            # can be rebuilt from, and it is keyed by composition because that
+            # is what was asked for -- a task number is an accident of
+            # scheduling that changes on the next run.
+            from .. import artifacts
+
+            kept = artifacts.db_path(self.cfg.work_dir, row["formula"], "generated")
+
             written = 0
             for atoms in ase.io.read(str(path), index=":"):
-                store.add_structure(
+                sid = store.add_structure(
                     atoms, origin=Origin.generated, state=StructureState.new,
                     composition_id=cid, reduced_formula=row["formula"],
                     generator=payload.get("engine", "mattergen"),
                 )
                 written += 1
+                # After the store, so the id it is filed under is the real one.
+                artifacts.record(
+                    kept, atoms,
+                    structure_id=int(sid), reduced_formula=row["formula"],
+                    campaign=self.cfg.campaign.name,
+                    composition_id=cid,
+                    generator=payload.get("engine", "mattergen"),
+                    model=str(payload.get("model") or ""),
+                    origin="generated",
+                )
 
             # `written` is what the database now holds; `n_produced` is what the
             # worker counted. They should agree, and a mismatch means the file

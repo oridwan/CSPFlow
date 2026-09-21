@@ -1,0 +1,156 @@
+# t2-composition-list -- SMOKE TEST for source mode `composition_list`.
+#
+# WHAT THIS MODE DOES
+#     You name the formulas outright. No sweep, no element groups: the source
+#     stage takes each formula, expands it over the z range you give, and hands
+#     MatterGen a composition to generate structures for. Use it when you
+#     already know which phases you care about.
+#
+# HOW IT DIFFERS FROM t1
+#     Same funnel, same engines, same chemistry -- only the SOURCE differs.
+#     t1 derives its systems from rules; this one is told them. Running both
+#     and getting the same DFT stage behaviour is the point of having two.
+#
+# RUNTIME: as t1 -- MatterGen on a GPU is the long pole.
+name: t2-composition-list
+machine: orion
+workdir: /scratch/$USER/cspflow/t2-composition-list
+archive: null
+
+source:
+  - mode: composition_list
+    name: shortlist
+    composition_list:
+      items:
+        # Both are REAL Ce-Fe phases that the reference store already holds, so
+        # the generated structures can be compared against a known answer:
+        # a good one should land near e_above_hull = 0.
+        - formula: CeFe2       # 6 atoms at z=1
+          z: [1, 1]
+          n_structures: {mode: fixed, count: 8}
+        - formula: CeFe5       # 6 atoms at z=1
+          z: [1, 1]
+          n_structures: {mode: fixed, count: 8}
+      # `from_file:` is the other way in -- inputs/compositions.csv. Left out
+      # here so this file is the single source of truth for the test.
+    defaults:
+      # No `max_atoms`: both formulas above are 6 atoms and z is pinned at 1, so
+      # every cell is 6 atoms and any cap is unreachable. A limit that cannot
+      # fire is not a safeguard, it is noise. Add one if you widen z or add a
+      # formula with a different atoms-per-formula-unit.
+      z: {min: 1, max: 1}
+      n_structures: {mode: fixed, count: 8}
+      n_structures_scope: per_z
+
+generate:
+  engine: mattergen
+  mattergen:
+    model: /projects/mmi/shuo/MatterGen_checkpoints/18-55-08
+    mode: csp
+    max_batch_size: 8
+    timeout_per_batch: 900
+  resources: {role: gpu, gpus: 1, time: "01:00:00"}
+
+screen:
+  mlip: mattersim
+  mattersim:
+    model: MatterSim-v1.0.0-5M.pth
+    fmax: 0.05
+    max_steps: 100
+  dedup:
+    matcher: {ltol: 0.2, stol: 0.2, angle_tol: 5.0}
+  resources: {role: gpu, gpus: 1, time: "01:00:00"}
+
+# ---------------------------------------------------------------- reference --
+# Ce-Fe is chosen because the shared store ALREADY HOLDS ALL FIVE of its phases
+# at our own DFT settings (CeFe2, CeFe5, Ce4Fe, Ce2Fe17 x2, all `ready=True`).
+# So the reference stage finds a complete hull and computes nothing: the stage
+# that would otherwise dominate a test run costs seconds.
+#
+# Check before changing the chemistry:
+#   python -c "import csv;rows=list(csv.DictReader(open('/projects/mmi/cspflow-shared/store/index.csv')));print([ (r['formula'],r['ready']) for r in rows if r['chemsys']=='Ce-Fe'])"
+reference:
+  functionals: [GGA]
+  thermo_type: GGA_GGA+U
+  energy_scale: raw
+  mode: recompute            # our own energies, from the shared store
+  prescreen_mode: mp_energies
+  prescreen_hull_max: 0.50   # wide: a smoke test must not lose everything here
+  snapshot: true
+  relax_with_mlip: true
+
+# ------------------------------------------------------------------- filter --
+filter:
+  e_above_hull_max: 0.50     # deliberately loose. The point is to REACH DFT,
+                             # not to select well; a tight cut on a handful of
+                             # structures is how a smoke test ends with zero
+                             # candidates and tells you nothing.
+  e_above_hull_max_source: literal   # NOT 'calibrated': calibration was
+                             # retired from the funnel (D126), so there is no
+                             # fitted alpha/beta to rescale the threshold by.
+  max_per_composition: 3
+  spacegroup: {min_number: 1}
+
+# ---------------------------------------------------------------------- dft --
+dft:
+  recipe: recipe.yaml        # the campaign-local `smoke` recipe. Resolves
+                             # against THIS folder, not the shell's cwd (D132).
+  layout: runs               # one directory per structure...
+  combined_job: true         # ...and one job per structure, relax+static in it
+  potcar:
+    tree: VASP6.4
+    functional: PBE_64
+    overrides: {}
+  # THIS BLOCK IS COPIED VERBATIM FROM THE STORE'S store-settings.yaml, and
+  # that is the whole point. `recipe_id` hashes the campaign's dft block; if it
+  # differs from the store's, candidate and reference energies land on
+  # different scales, the hull still builds, looks correct, and ranks wrongly
+  # (D101). `csp doctor` says so -- and it says so about the PRODUCTION CePdGe
+  # campaign too, which uses `ferri`/`ferrimagnetic_retm` against the store's
+  # `ferro`/`ferromagnetic`.
+  #
+  # A test campaign is the one place that mismatch is not acceptable, because
+  # a test whose numbers cannot be graded is not a test. Matching the store is
+  # what makes "the seeds should come back near e_above_hull = 0" a real
+  # expectation instead of a hope.
+  rare_earth:
+    f_treatment: frozen      # Ce 4f in the core. NOTE: m_dft_raw is then ~0 for
+                             # Ce BY CONSTRUCTION -- correct behaviour here, not
+                             # a failed test (see the 4f trap).
+    magnetic_order: ferro
+    reconstruct_ms: true
+  magnetism:
+    # `mode` is materialised into `table` below, because recipe_id hashes the
+    # NUMBERS, not the mode name. Copying the mode without the table gives a
+    # different fingerprint and a mixed-scale hull.
+    mode: ferromagnetic
+    strict: true             # KEPT strict: a silent default moment is the bug
+                             # this flag exists to catch
+    table:                   # merges into FERRO_RETM; adds only these elements
+      As: 0.6
+      Sb: 0.6
+      Bi: 0.6
+      Au: 0.6
+      Ru: 3.0                # 4d7 Hund maximum -- the one non-trivial value
+      In: 0.6
+      Se: 0.6
+      Te: 0.6
+  ldau: {enabled: false, ldau_type: 2, u: {}, j: {}}
+  nbands: auto
+  incar_overrides: {}
+  max_in_flight: 8           # small on purpose: a test should be visible in
+  max_concurrent_tasks: 8    # `squeue` at a glance, not fill it
+  max_cores: 128             # the cap that binds: 8 jobs x 16 ranks. Counts
+                             # this campaign's QUEUED and RUNNING jobs, nobody
+                             # else's, recomputed every cycle.
+  select:
+    rank_by: e_above_hull_mlip
+    max_per_composition: 2
+    max_total: 6             # LIFETIME ceiling for the campaign, not per cycle
+                             # (no budget_core_hours: retired, D143 -- cap cores
+                             # with dft.max_cores above, not projected spend)
+
+# ------------------------------------------------------------------ analyze --
+analyze:
+  properties: [m_dft_raw, m_s_reconstructed, volume, spacegroup]
+  report: html

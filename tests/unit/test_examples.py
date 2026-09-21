@@ -7,6 +7,7 @@ fails here rather than in a user's first campaign.
 """
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -78,3 +79,75 @@ def test_the_biggest_seed_clears_the_max_atoms_gate():
     assert cap >= 57
     assert max(s.n_atoms for s in plan.structures) == 57
     assert len(plan.structures) == 5
+
+
+# --- the examples are the `csp init` templates ------------------------------
+
+EXAMPLE_NAMES = ["1-chemical-space", "2-composition-list", "3-structure-list"]
+
+
+@pytest.mark.parametrize("name", EXAMPLE_NAMES)
+def test_example_machine_and_recipe_are_what_init_writes(name):
+    """The copies are generated, not hand-edited, so they cannot drift from the
+    shipped profile and recipe that `csp init` copies."""
+    import yaml
+    from cspflow import templates
+    from cspflow.config.loader import resolve_machine_path
+    from cspflow.dft.recipe import RECIPE_DIR
+
+    folder = EXAMPLES / name
+    campaign = yaml.safe_load((folder / "campaign.yaml").read_text())
+    assert campaign["machine"] == "machine.yaml"
+    assert campaign["dft"]["recipe"] == "recipe.yaml"
+    assert (folder / "machine.yaml").read_text() == templates.machine_copy(
+        resolve_machine_path("orion"), name=campaign["name"])
+    assert (folder / "recipe.yaml").read_text() == templates.recipe_copy(
+        RECIPE_DIR / "magnets.yaml", name=campaign["name"])
+
+
+@pytest.mark.parametrize("name", EXAMPLE_NAMES)
+def test_no_knob_wired_to_nothing(name):
+    """D137, D146: a setting no code reads looks exactly like one that matters.
+    These were in the examples and read by nothing (calibrate left the funnel in
+    D126; archive was never written; analyze.* has no consumer)."""
+    import yaml
+
+    doc = yaml.safe_load((EXAMPLES / name / "campaign.yaml").read_text())
+    assert not {"calibrate", "archive", "analyze"} & set(doc)
+    assert set(doc["reference"]) == {"thermo_type", "energy_scale", "mode", "energy_source"}
+    assert "e_above_hull_max_source" not in doc["filter"]
+    assert "max_per_composition" not in doc["dft"]["select"], "read only under filter:"
+    if name == "3-structure-list":
+        assert "generate" not in doc and "defaults" not in doc["source"][0], \
+            "z and structure counts do not apply to seeds"
+
+
+# `key: value   # a | b | c` -- a pick-one list of bare values beside a setting.
+_OPTIONS = re.compile(
+    r"^(?P<head>[ \t]*(?:- )?(?P<key>\w+): )(?P<value>\S+)(?P<gap>\s{2,})"
+    r"# (?P<opts>[^\s|]+(?: \| [^\s|]+)+)(?=\s|$)(?P<tail>.*)$", re.M)
+
+
+@pytest.mark.parametrize("name", EXAMPLE_NAMES)
+def test_every_listed_alternative_is_accepted_by_the_schema(name):
+    """`magnetic_order: ferri  # ferri | ferro | antiferro` was in an example, and
+    `antiferro` is rejected. A listed option must be one the schema takes.
+
+    Swapping one value can break a CROSS-check (fixed needs `count:`); that is
+    allowed. What is not allowed is an error on the setting itself."""
+    import yaml
+    from pydantic import ValidationError
+    from cspflow.config.schema import Campaign
+
+    text = (EXAMPLES / name / "campaign.yaml").read_text()
+    matches = list(_OPTIONS.finditer(text))
+    assert len(matches) >= 15, "the option-comment format changed; this test went blind"
+    for m in matches:
+        for alt in m.group("opts").split(" | "):
+            line = f"{m.group('head')}{alt}{m.group('gap')}# {m.group('opts')}{m.group('tail')}"
+            doc = yaml.safe_load(text[:m.start()] + line + text[m.end():])
+            try:
+                Campaign.model_validate(doc)
+            except ValidationError as exc:
+                own = [e for e in exc.errors() if e["loc"] and e["loc"][-1] == m.group("key")]
+                assert not own, f"{name}: {m.group('key')}: {alt} is listed but rejected: {own}"

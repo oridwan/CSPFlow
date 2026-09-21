@@ -38,6 +38,49 @@ from .base import StageReport, WorkItem
 DEFAULT_CHUNK = 500
 
 
+
+# --------------------------------------------------------------------------
+# Naming
+# --------------------------------------------------------------------------
+
+
+def _batch_tag(items: list[WorkItem]) -> str:
+    """A name for the submission that describes the WHOLE submission.
+
+    It used to be `items[0].key` -- the first CHUNK's id range. One sbatch
+    covers an array of chunks, so a job spanning structures 1-200 in four
+    chunks went out called `screen-1-50`, naming a fifth of its own work. That
+    is the same fault D130 found on the DFT side, where ten hours went into
+    reading the directory a job name pointed at while the job ran elsewhere.
+
+    So the span is taken across every chunk, ids are zero-padded (string sort =
+    numeric sort, and `ids-0001-0003` cannot be misread as "1 of 3" the way
+    `screen-1-3` can), and anything covering more than one chunk says so:
+
+        one chunk, ids 1-3      ->  ids-0001-0003
+        four chunks, ids 1-200  ->  ids-0001-0200-x4
+    """
+    ids = sorted({sid for item in items for sid in item.structure_ids})
+    if not ids:
+        return "ids-empty"
+    span = f"ids-{ids[0]:04d}-{ids[-1]:04d}"
+    return span if len(items) == 1 else f"{span}-x{len(items)}"
+
+
+def _results_path(workdir: Path, tag: str, index: int) -> Path:
+    """Where task `index` of `tag` wrote its results.
+
+    Checks the current layout first and the pre-D136 flat one second. A results
+    file that cannot be found is a whole chunk of screened structures marked
+    failed, so the old location is still READ long after it stopped being
+    written.
+    """
+    current = workdir / "batches" / tag / f"results-task{index}.json"
+    if current.is_file():
+        return current
+    legacy = workdir / f"{tag}.task{index}.json"
+    return legacy if legacy.is_file() else current
+
 class ScreenStage:
     name = "screen"
     role = "gpu"
@@ -97,8 +140,20 @@ class ScreenStage:
         """
         workdir = workdir.resolve()
         workdir.mkdir(parents=True, exist_ok=True)
-        tag = items[0].key
-        manifest = workdir / f"{tag}.manifest.json"
+        tag = _batch_tag(items)
+        # Every task's results are named after this one tag, so each item has to
+        # carry it: by reconcile time an item may arrive alone, and its own key
+        # names a file the worker never wrote (D121).
+        for item in items:
+            item.group_key = tag
+        # ONE DIRECTORY PER SUBMISSION (D136), the same shape `runs/` gives DFT.
+        # Everything the worker writes is derived from the manifest's parent, so
+        # putting the manifest here puts the results, the progress files and the
+        # relaxed geometries here too -- and `spec.workdir` below puts the job
+        # script and the SLURM log in beside them.
+        batch_dir = workdir / "batches" / tag
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        manifest = batch_dir / "inputs.json"
         manifest.write_text(json.dumps({
             "key": tag,
             "db": str(self.cfg.campaign_db.resolve()),
@@ -117,7 +172,7 @@ class ScreenStage:
 
         resources = self.cfg.campaign.screen.resources
         return JobSpec(
-            name=tag, stage=self.name, workdir=workdir,
+            name=tag, stage=self.name, workdir=batch_dir,
             command=f"csp screen-worker --manifest {manifest}",
             role=self.role, ntasks=resources.ntasks or 1,
             cpus_per_task=resources.cpus_per_task or 1,
@@ -132,8 +187,10 @@ class ScreenStage:
                   items: list[WorkItem]) -> None:
         """Read what the workers wrote and record it.  Only the driver writes."""
         workdir = Path(job_row["workdir"])
-        for index, item in enumerate(items):
-            results_file = workdir / f"{item.key}.task{index}.json"
+        for position, item in enumerate(items):
+            index = item.task_index if item.task_index is not None else position
+            tag = item.group_key or item.key
+            results_file = _results_path(workdir, tag, index)
             if not results_file.is_file():
                 # The task produced nothing. Its structures are still marked
                 # `screening`, which is the correct record: work was claimed and
@@ -159,6 +216,12 @@ class ScreenStage:
                 continue
 
             store.add_relaxation(
+                # `energy`, not `e_total`. The worker's ASE key_value_pairs row
+                # must call it `e_total` (ASE reserves `energy` on a row), and
+                # that name leaked into this call -- but `relaxation` has an
+                # `energy` column and no `e_total`, so every absorb raised
+                # TypeError and the whole MLIP screen path died. Fixed
+                # 2026-09-15; two tests in test_mlip.py cover it.
                 structure_id=sid, engine=row.get("engine", "mattersim"),
                 energy=row.get("energy"), e_per_atom=row.get("e_per_atom"),
                 converged=bool(row.get("converged")), n_steps=int(row.get("n_steps", 0)),
@@ -173,6 +236,25 @@ class ScreenStage:
                   "mlip_relaxed": bool(row.get("relaxed", True))}
             if row.get("volume_drift") is not None:
                 kv["mlip_volume_drift"] = float(row["volume_drift"])
+
+            # Carry the relaxed cell back into the row, so the DFT relax starts
+            # from it instead of from the seed as supplied. Only when the MLIP
+            # actually moved the structure: a `single_point` seed is one the
+            # campaign asked NOT to move, and replacing its geometry would be
+            # exactly the thing that setting exists to prevent.
+            geometry = row.get("geometry")
+            if geometry and row.get("relaxed", True):
+                carried = _read_relaxed(geometry, sid)
+                if carried is not None:
+                    store.replace_geometry(sid, carried)
+                    kv["mlip_geometry"] = str(geometry)
+                    # And into the composition-keyed record, which is what the
+                    # campaign can be rebuilt FROM (D141). The driver writes it,
+                    # not the worker: a chunk spans many compositions and two
+                    # chunks can share one, so workers here would contend on the
+                    # same SQLite file.
+                    self._keep(store, sid, carried, row, kv)
+
             store.set_structure_state(sid, StructureState.screened, **kv)
             store.add_filter_event(
                 structure_id=sid, gate="screen:converged",
@@ -184,3 +266,115 @@ class ScreenStage:
 
     def run(self, store: Store) -> StageReport:            # pragma: no cover
         raise AssertionError("screen is a submitted stage; the driver calls claim/build")
+
+
+    def _keep(self, store: Store, sid: int, atoms, row: dict, kv: dict) -> None:
+        """File one relaxed cell under its composition. Never fatal.
+
+        This database is the safety net under `campaign.db`. A campaign that
+        stopped because its safety net could not be written would be worse than
+        one that carries on without it, so every failure here is swallowed --
+        the authoritative record of this result is already in the store by the
+        time this runs.
+        """
+        from .. import artifacts
+
+        try:
+            structure = next(store.structures(id=sid), None)
+            skv = structure.key_value_pairs if structure is not None else {}
+            formula = skv.get("reduced_formula") or (
+                structure.formula if structure is not None else "") or "unknown"
+            artifacts.record(
+                artifacts.db_path(self.cfg.work_dir, formula, "relaxed"), atoms,
+                structure_id=sid, reduced_formula=formula,
+                campaign=self.cfg.campaign.name,
+                source_name=skv.get("source_name", ""),
+                source_path=skv.get("source_path", ""),
+                origin=skv.get("origin", ""),
+                e_total=row.get("energy"), e_per_atom=row.get("e_per_atom"),
+                converged=bool(row.get("converged")),
+                n_steps=int(row.get("n_steps") or 0),
+                fmax_final=row.get("fmax"),
+                volume_drift=row.get("volume_drift"),
+                engine=row.get("engine", ""),
+                e_above_hull_mlip=kv.get("e_above_hull_mlip"),
+            )
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def _read_relaxed(path: str, structure_id: int | None = None):
+    """The relaxed cell the worker saved, or None if it cannot be read.
+
+    Two shapes, because both exist on disk:
+
+    *   `relaxed-task<N>.db` (D141) -- one ASE database per task, from which the
+        row for THIS structure is selected. A database read without an id would
+        return whichever row came first, which is a silent way to hand a
+        campaign the wrong geometry.
+    *   `relaxed-task<N>/<sid>.vasp` -- one file per structure, what the worker
+        wrote before. Still read, because a campaign screened last week has
+        these and nothing else.
+
+    A task database is read ONCE, whole, and kept (`_task_cells`): reconcile
+    asks for its 500 structures one at a time, and opening a 500-row database
+    500 times over NFS was a per-structure round trip for no reason (D144).
+
+    Only geometry columns are read (D145). Databases written before that fix
+    hold float32 force blobs that ASE decodes as float64 and raises on for an
+    odd atom count; the positions beside them were always float64 and intact.
+
+    None is not fatal: the energy is still valid and the campaign proceeds on
+    the original geometry, which is what it did before these files existed. A
+    missing cell must not lose a screening result.
+    """
+    from pathlib import Path as _Path
+
+    target = _Path(path)
+    try:
+        if target.suffix == ".db":
+            if structure_id is None or not target.is_file():
+                return None
+            atoms = _task_cells(target).get(int(structure_id))
+            return atoms.copy() if atoms is not None else None
+
+        from ase.io import read as ase_read
+
+        if not target.is_file() or not target.stat().st_size:
+            return None
+        return ase_read(str(target))
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+#: (path, mtime_ns, size) -> {structure_id: Atoms}. Small on purpose: reconcile
+#: walks one task file at a time, so the last few are all that is ever reused.
+_TASK_CELLS: "dict[tuple, dict[int, Any]]" = {}
+_TASK_CELLS_KEEP = 4
+
+
+def _task_cells(target: Path) -> "dict[int, Any]":
+    """Every cell in one relaxed-task database, keyed by structure id.
+
+    Keyed on mtime and size too, so a task file rewritten by a retry is read
+    again rather than served stale.
+    """
+    from ase.db import connect
+
+    from ..artifacts import GEOMETRY_COLUMNS
+
+    stat = target.stat()
+    key = (str(target), stat.st_mtime_ns, stat.st_size)
+    cells = _TASK_CELLS.get(key)
+    if cells is not None:
+        return cells
+    cells = {}
+    with connect(str(target), use_lock_file=False) as db:
+        for row in db.select(columns=GEOMETRY_COLUMNS, include_data=False):
+            sid = row.key_value_pairs.get("structure_id")
+            if sid is not None:
+                cells[int(sid)] = row.toatoms()
+    while len(_TASK_CELLS) >= _TASK_CELLS_KEEP:
+        _TASK_CELLS.pop(next(iter(_TASK_CELLS)))
+    _TASK_CELLS[key] = cells
+    return cells

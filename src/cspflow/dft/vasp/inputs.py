@@ -28,10 +28,15 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ...config.schema import Dft, Machine
-from ..recipe import RecipeStage
+from ..recipe import RecipeStage, tag_value
 from . import potcar as pc
 from .incar import IncarContext, build_incar, render_incar
-from .kpoints import KpointGrid, grid_for
+from .kpoints import KpointGrid, canonical_cell, carry_grid, grid_for
+from .parallel import irreducible_kpoints
+from .parallel import plan as parallel_plan
+
+# VASP's own floor for ISMEAR=-5; below it the run aborts.
+TETRAHEDRON_MIN_KPOINTS = 4
 
 
 class InputError(Exception):
@@ -48,6 +53,11 @@ class ResolvedInputs:
     symbols: list[str]                 # POSCAR species order
     potcars: list[pc.PotcarInfo] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # The cell the grid was actually chosen from -- see kpoints.canonical_cell.
+    # write_inputs must use this and not the caller's copy, or POSCAR and
+    # KPOINTS describe different bases.
+    atoms: Any = None
+    parallel: Any = None
 
     @property
     def settings_hash(self) -> str:
@@ -94,8 +104,15 @@ def resolve_inputs(
     machine: Machine,
     *,
     ntasks: int | None = None,
+    carried_grid: KpointGrid | None = None,
 ) -> ResolvedInputs:
-    """Work out every input file's contents.  Writes nothing."""
+    """Work out every input file's contents.  Writes nothing.
+
+    `carried_grid` is the grid a previous attempt of this same step actually
+    ran with. Passing it keeps a resumed relaxation on the sampling it was
+    already using instead of re-deriving one from the cell it has reached --
+    see `kpoints.carry_grid` for why that distinction is not cosmetic.
+    """
     symbols = _species_order(atoms)
     infos, errors = pc.resolve_all(
         sorted(set(symbols)), machine,
@@ -134,11 +151,104 @@ def resolve_inputs(
             f"for that species."
         )
 
+    # The grid must come from a canonical basis, not from however the source
+    # happened to write the lattice down.  See kpoints.canonical_cell.
+    source_lengths = list(atoms.cell.lengths())
+    atoms = canonical_cell(atoms)
     grid = grid_for(list(atoms.cell.lengths()), stage.kpoints, n_atoms=len(atoms))
 
+    # A resume keeps the grid it was already running.  The derived grid is
+    # still computed, because the interesting case is the one where the two
+    # disagree: that is a relaxation whose cell drifted across a floor()
+    # boundary, and it is recorded here so the manifest shows it happened
+    # rather than leaving two attempts silently incomparable.
+    if carried_grid is not None:
+        remapped = carry_grid(carried_grid, source_lengths,
+                              list(atoms.cell.lengths()))
+        if remapped is None:
+            warnings.append(
+                f"could not carry the previous attempt's "
+                f"{carried_grid.a}x{carried_grid.b}x{carried_grid.c} grid onto this "
+                f"cell -- the canonical basis changed by more than a permutation. "
+                f"Falling back to the derived {grid.a}x{grid.b}x{grid.c} grid; the "
+                f"two attempts are not sampled alike."
+            )
+        else:
+            if (remapped.a, remapped.b, remapped.c) != (grid.a, grid.b, grid.c):
+                warnings.append(
+                    f"k-point grid carried from the previous attempt: "
+                    f"{remapped.a}x{remapped.b}x{remapped.c}. The cell reached by "
+                    f"that attempt would have derived "
+                    f"{grid.a}x{grid.b}x{grid.c} instead -- re-deriving it would "
+                    f"move the energy surface under a geometry that is already "
+                    f"near its minimum."
+                )
+            grid = remapped
+
+    # The tetrahedron method needs at least four k-points.  Below that VASP does
+    # not approximate -- it aborts ("Tetrahedron method fails for NKPT<4"), and
+    # it does so in the STATIC step, after the relaxation has already been paid
+    # for.  Measured on this reference set: 35 of 2,746 MP phases land on a grid
+    # product below 4 at reciprocal_density 64, 29 of them Gamma-only.
+    #
+    # The fallback is Gaussian smearing, not a denser grid.  A cell whose grid
+    # collapses to Gamma is a large cell with a small Brillouin zone, where
+    # Gamma-only sampling is already adequate and forcing more k-points would
+    # cost far more than the few meV of smearing difference.
+    #
+    # This is a per-STRUCTURE resolution, so it lands in `settings_hash` and not
+    # in `recipe_id`: the recipe still says ISMEAR -5, and the cache stays one
+    # cache.  The substitution is recorded here so it is visible in the manifest
+    # rather than being an unexplained difference between two INCARs.
+    # The IRREDUCIBLE count, not the grid product.  VASP folds the mesh by
+    # symmetry before BZINTS counts, so a 2x2x2 grid -- product 8, comfortably
+    # over the limit -- can present VASP with 3 k-points and abort:
+    #     VERY BAD NEWS! internal error in subroutine BZINTS:
+    #     Tetrahedron method fails (number of k-points < 4) 3
+    # Measured 2026-09-10 on mp-1192814-Ce3Si3Pd102 and three others, all of
+    # which the old grid-product test waved through.  spglib supplies the same
+    # number the parallel planner below already asks it for.
+    nkpts = irreducible_kpoints(
+        atoms.cell[:], atoms.get_scaled_positions(), atoms.get_atomic_numbers(),
+        (grid.a, grid.b, grid.c),
+    )
+    if nkpts is None:               # spglib absent: the grid product is a
+        nkpts = grid.total          # valid upper bound
+    if str(tag_value(incar, "ISMEAR", 0)).strip() == "-5":
+        n_kpoints = nkpts
+        if n_kpoints < TETRAHEDRON_MIN_KPOINTS:
+            incar["ISMEAR"] = 0
+            incar.setdefault("SIGMA", 0.05)
+            warnings.append(
+                f"ISMEAR -5 replaced with 0 (SIGMA {incar['SIGMA']}): the "
+                f"{grid.a}x{grid.b}x{grid.c} grid folds to {n_kpoints} "
+                f"irreducible k-point(s) and "
+                f"the tetrahedron method needs at least {TETRAHEDRON_MIN_KPOINTS}. "
+                f"VASP would abort rather than approximate."
+            )
+
     ordered = [by_element[s] for s in symbols]
+    # --- how the job will be divided across ranks -------------------------
+    # NCORE and KPAR change only how the work is split, never the converged
+    # answer, so they land in settings_hash and never in recipe_id.  A fixed
+    # NCORE across a campaign is wrong whenever the k-point count varies: this
+    # reference set spanned 1 to 232 irreducible k-points on one NCORE = 8.
+    par = None
+    if ntasks:
+        try:
+            par = parallel_plan(
+                nkpts=nkpts,
+                nbands=int(tag_value(incar, "NBANDS", 0) or 0),
+                ntasks=int(ntasks),
+                cores_per_socket=getattr(machine, "cores_per_socket", None),
+            )
+            incar.update(par.incar_tags())
+        except Exception as exc:        # never let a tuning choice stop a run
+            warnings.append(f"parallelization left at recipe defaults: {exc}")
+
     return ResolvedInputs(stage=stage.name, incar=incar, grid=grid,
-                          symbols=symbols, potcars=ordered, warnings=warnings)
+                          symbols=symbols, potcars=ordered, warnings=warnings,
+                          atoms=atoms, parallel=par)
 
 
 def write_inputs(resolved: ResolvedInputs, atoms, directory: Path) -> Path:
@@ -151,7 +261,9 @@ def write_inputs(resolved: ResolvedInputs, atoms, directory: Path) -> Path:
                      comment=f"cspflow {resolved.stage}  {resolved.short_hash}")
     )
     (directory / "KPOINTS").write_text(resolved.grid.render())
-    _write_poscar(atoms, resolved.symbols, directory / "POSCAR")
+    # the canonical cell the grid was chosen from, never the caller's copy
+    _write_poscar(resolved.atoms if resolved.atoms is not None else atoms,
+                  resolved.symbols, directory / "POSCAR")
     _concat_potcars(resolved.potcars, directory / "POTCAR")
 
     (directory / "inputs.json").write_text(json.dumps({

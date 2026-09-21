@@ -16,7 +16,7 @@ from cspflow.dft.vasp.potcar import (
     tree_directory,
 )
 
-TREE = Path("/projects/mmi/Ridwan/potcarFiles/VASP6.4/potpaw_PBE")
+TREE = Path("/projects/mmi/cspflow-shared/potcars/VASP6.4/potpaw_PBE")
 has_tree = pytest.mark.skipif(not TREE.is_dir(), reason="local POTCAR tree not present")
 
 
@@ -44,6 +44,23 @@ def test_overrides_always_win():
     syms = potcar_symbols(["Fe", "Gd"], f_treatment=FTreatment.frozen,
                           overrides={"Fe": "Fe", "Gd": "Gd"})
     assert syms == {"Fe": "Fe", "Gd": "Gd"}
+
+
+def test_lanthanum_has_no_frozen_variant_because_it_has_no_4f():
+    """La is 4f0, so VASP ships no `La_3` and the bare symbol IS the frozen
+    convention.  Without this a La campaign fails at its first structure with a
+    missing-POTCAR error rather than at configuration time."""
+    syms = potcar_symbols(["La", "Sm", "Gd"], f_treatment=FTreatment.frozen)
+    assert syms == {"La": "La", "Sm": "Sm_3", "Gd": "Gd_3"}
+
+
+def test_lanthanum_counts_as_frozen_not_as_f_in_valence():
+    """The suffix heuristic reads bare `La` as f-in-valence and is wrong: there
+    are no f electrons to put there.  ZVAL 11 (5s2 5p6 5d1 6s2) is in the
+    frozen-core range; every genuine f-in-valence dataset is 14-20.  Left
+    uncorrected, La trips `assert_one_f_convention` against its own correctly
+    frozen Sm_3 and Gd_3."""
+    assert f_in_valence("La", "La", 11.0) is False
 
 
 def test_yttrium_is_not_a_rare_earth_here():

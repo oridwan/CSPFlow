@@ -1,0 +1,100 @@
+# Scheduler profile for the 'example-shortlist' campaign.
+# Copied from the shipped profile orion.yaml so it can be edited
+# here -- partition, walltime, modules, VASP binary, POTCAR trees.
+# Delete this file and set `machine: orion` in campaign.yaml
+# to go back to the shipped one and pick up its updates.
+#
+# UNC Charlotte research cluster.
+# Partitions verified live 2026-08-26 via `sinfo`:
+#   Orion (118 nodes) | Apus (11) | Nebula (13) | GPU (14) | Nebula_GPU (8)
+#   Hydrus (1) | DTN (2)
+scheduler: slurm
+
+# The CPU pool is heterogeneous and the VASP build is not portable across it.
+# `vasp_std` carries 5,285 AVX-512 (zmm) instructions, so it dies instantly with
+# `forrtl: severe (168): illegal instruction` on any node without AVX-512 -- no
+# OUTCAR, no vasprun.xml, nothing to diagnose from except the node name.
+# Orion/Apus hold 12 such nodes: 10 EPYC Rome (Zen 2, str-c88..c97), 1 Milan
+# (Zen 3) and 1 Broadwell.  Measured 2026-09-09: 21 of 21 DFT failures were on
+# Rome, 0 on anything else.
+#
+# This is an ALLOW-list of AVX-512-capable features rather than a deny-list of
+# node names, so a newly added architecture is simply not used instead of
+# crashing every job that lands on it.
+partitions:
+  # Allow-list, not a deny-list: a new architecture nobody has checked is
+  # excluded until someone does, which is the safe direction.  Every feature
+  # here was verified to carry avx512f with a live lscpu probe on 2026-09-09;
+  # `skylake` is Nebula's Xeon Gold 6154, which has it, and is listed so that
+  # adding Nebula to `cpu` does not silently exclude the whole partition.
+  # Missing on purpose: rome, milan, broadwell -- none have AVX-512, and
+  # vasp_std has 5,285 AVX-512 instructions.
+  cpu:        {name: "Orion,Apus", constraint: "caslake|genoa|turin|skylake|sapphire_rapids"}
+  gpu:        {name: "GPU"}
+  bigmem:     {name: "Hydrus"}
+  short:      {name: "Nebula"}
+  short_gpu:  {name: "Nebula_GPU"}
+
+defaults:
+  nodes: 1
+  ntasks: 16
+  cpus_per_task: 1
+  mem: 32G
+
+# Starting points only -- `csp doctor` re-reads the live limits from sacctmgr
+# and scontrol, and the driver throttles against what it finds, not against
+# what is written here.
+limits:
+  cpu:  {max_submit: 2048, max_cpus: 768, max_walltime: "30-00:00:00"}
+  gpu:  {max_submit: 128,  max_gpus: 12,  max_walltime: "30-00:00:00"}
+  short: {max_walltime: "2-00:00:00"}
+
+modules:
+  cpu: [intel/mkl/2024.0, intel/2024, intel-mpi/2021.11]
+  # No CUDA module. Verified on a GPU node 2026-08-27: the driver is 570.195.03
+  # (CUDA 12.8) and the cspflow env's torch 2.2.1+cu118 ships its own runtime,
+  # so `torch.cuda.is_available()` is True with nothing loaded.
+  #
+  # `cuda/11.8` -- which every script under /projects/mmi/shuo still loads -- no
+  # longer exists on this cluster; only 12.4, 12.8 and 13.2 do. `module load` of
+  # a missing module writes to stderr and still exits 0, so under `set -e` the
+  # job dies at the *next* command with no useful message. `csp doctor` now
+  # checks every configured module against `module -t avail`.
+  gpu: []
+
+env:
+  OMP_NUM_THREADS: 1
+  I_MPI_FABRICS: "shm:ofi"
+  # Intel MPI has to be told which PMI library SLURM provides. Without it
+  # `srun --mpi=pmi2` starts, the pmi2 plugin rejects every client request
+  # ("request not begin with 'cmd='"), and PMPI_Init aborts -- an error that
+  # names neither the variable nor the library. Verified 2026-08-27: this path
+  # exists on Orion/Apus and /opt/slurm/lib/libpmi.so does not.
+  # `csp doctor` checks that every env value that looks like a path is there.
+  I_MPI_PMI_LIBRARY: /usr/lib64/libpmi.so.0
+
+codes:
+  vasp_std: /projects/mmi/cspflow-shared/vasp/bin/vasp_std
+  mpi_launcher: "srun --mpi=pmi2"
+
+# pymatgen expects functional labels to map to specific directory NAMES, which
+# the raw potpaw_PBE trees do not use.  `csp doctor --fix` creates this
+# symlink layout; without it `functional: PBE_64` silently falls back to a
+# flat-layout match and the label misdescribes what is actually on disk.
+potcar_root: /projects/mmi/cspflow-shared/potcars/pmg
+potcar_dirs:
+  PBE_64: POT_PAW_PBE_64          # -> VASP6.4/potpaw_PBE
+  PBE_52: POT_GGA_PAW_PBE_52      # -> VASP5.2/potpaw_PBE
+potcar_trees:
+  VASP6.4: PBE_64
+  VASP5.2: PBE_52
+
+# One environment for every role.  mattergen depends on mattersim, so they were
+# always meant to share an env; the legacy split (mattersim for MLIP, vaspflow
+# for DFT) is what forced every driver script to know which env each stage
+# needed.  Built by scripts/build_env.sh.
+conda:
+  cpu: cspflow
+  gpu: cspflow
+
+scratch: /scratch/$USER

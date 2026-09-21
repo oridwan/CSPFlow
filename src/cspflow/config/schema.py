@@ -15,6 +15,7 @@ Two rules run through this file and are worth stating once:
 
 from __future__ import annotations
 
+import warnings
 from enum import Enum
 from typing import Annotated, Any, Literal
 
@@ -220,12 +221,29 @@ class StructureList(Base):
     list it is a hazard: two seeds you supplied on purpose -- a relaxed and an
     unrelaxed copy of one prototype, say -- would be silently merged and you
     would never learn which survived.  See pipeline.md sec.0.3.
+
+    ``off`` is the third option, and it exists because the comparison is not
+    free.  `StructureMatcher.fit` costs ~320 ms on a 9-atom five-species cell,
+    and the pairs go as k-squared WITHIN each formula group: 232 CePdGe seeds
+    with four 14-member groups came to 739 fits and **237 seconds**, against
+    6.8 s to parse and validate all 232 files.  Use ``off`` when the overlap is
+    deliberate and already recorded elsewhere -- a campaign whose seeds come
+    from two design routes on purpose, with a provenance CSV saying which is
+    which, learns nothing from being told they overlap.
     """
 
     paths: list[str] = Field(..., min_length=1, description="POSCAR/CIF paths or globs")
     relax: bool = Field(True, description="MLIP-relax the seed before DFT")
-    dedup: Literal["warn", "drop"] = "warn"
+    dedup: Literal["warn", "drop", "off"] = "warn"
     max_atoms: int | None = Field(None, gt=0, description="defaults to source.defaults.max_atoms")
+
+    @field_validator("dedup", mode="before")
+    @classmethod
+    def _dedup_off_is_a_word(cls, v: Any) -> Any:
+        """`dedup: off`, written as documented, reaches here as the boolean False:
+        YAML 1.1 reads a bare `off` that way. Same trap and same fix as
+        `on_fail` (D065) -- translate it, because the user is not wrong."""
+        return "off" if v is False else v
 
 
 class Source(Base):
@@ -321,7 +339,39 @@ class MatterSim(Base):
     model: str = "MatterSim-v1.0.0-5M.pth"
     fmax: float = Field(0.01, gt=0, description="eV/A force convergence")
     max_steps: int = Field(500, gt=0)
-    batch_size: int = Field(32, gt=0)
+
+    # NOTE: there is no `batch_size`. Relaxation is ONE STRUCTURE AT A TIME.
+    #
+    # It was here, defaulted to 32, and read by nothing -- so it described GPU
+    # batching that does not happen. MatterSim's own `BatchRelaxer` is unusable
+    # against the installed ASE (two independent breakages, one of them inside
+    # mattersim's own loop), and it accepts no step limit, so an unconvergeable
+    # structure would have nothing to stop it. `mlip/mattersim_engine.py` runs
+    # ASE's optimizer against `MatterSimCalculator` instead, which honours
+    # `max_steps` and lets us own the convergence test. See that module's
+    # docstring for the measurements.
+    #
+    # A knob wired to nothing is worse than no knob: it spends the reader's
+    # attention and implies a capability that is not there.
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_batch_size(cls, data):
+        """Accept and ignore `batch_size` from an older campaign.yaml.
+
+        `extra="forbid"` would otherwise make a file that sets it fail to load
+        entirely. Refusing to open a campaign over a setting that never did
+        anything is a worse outcome than opening it and saying so.
+        """
+        if isinstance(data, dict) and "batch_size" in data:
+            data = {k: v for k, v in data.items() if k != "batch_size"}
+            warnings.warn(
+                "screen.mattersim.batch_size is retired and was ignored: MLIP "
+                "relaxation runs one structure at a time, so it never had an "
+                "effect. Remove it from campaign.yaml.",
+                UserWarning, stacklevel=2,
+            )
+        return data
 
 
 class StructureMatcherCfg(Base):
@@ -334,9 +384,31 @@ class Dedup(Base):
     matcher: StructureMatcherCfg = Field(default_factory=StructureMatcherCfg)
 
 
+class CHGNet(Base):
+    """CHGNet's screen settings.
+
+    `fmax` defaults looser than MatterSim's 0.01. CHGNet is carried for its
+    MOMENTS, not to be the final geometry, and the moment is far less sensitive
+    to the last few meV/A than the energy is. Tighten it deliberately if CHGNet
+    is doing the relaxation rather than reading one.
+    """
+
+    model: str = Field("", description="path to weights; empty = CHGNet's shipped model")
+    fmax: float = Field(0.05, gt=0, description="eV/A force convergence")
+    max_steps: int = Field(500, gt=0)
+    mask_elements: list[str] = Field(
+        default_factory=list,
+        description="elements whose predicted moment is DISCARDED when summing. "
+                    "CHGNet inherits MP's f-in-valence convention, so its Ce/Gd "
+                    "moments are not what a frozen-f campaign reports [D1]. "
+                    "Masking is a deliberate choice and is recorded per seed.",
+    )
+
+
 class Screen(Base):
-    mlip: Literal["mattersim", "mace", "uma"] = "mattersim"
+    mlip: Literal["mattersim", "mace", "uma", "chgnet"] = "mattersim"
     mattersim: MatterSim = Field(default_factory=MatterSim)
+    chgnet: CHGNet = Field(default_factory=CHGNet)
     dedup: Dedup = Field(default_factory=Dedup)
     resources: Resources = Field(default_factory=lambda: Resources(role="gpu", gpus=1))
 
@@ -370,6 +442,21 @@ class Reference(Base):
     )
     energy_scale: Literal["raw", "mp_corrected"] = "raw"
     mode: Literal["mp_energies", "recompute"] = "recompute"
+    energy_source: Literal["dft", "mlip", "mp"] = Field(
+        "dft",
+        description=(
+            "Which of the store's three energies builds the hull, when "
+            "`mode: recompute`. Every structure in $CSPFLOW_STORE carries all "
+            "three and each defines a hull on its own scale:\n"
+            "  dft   our VASP recompute   (the default; what candidates are ranked on)\n"
+            "  mlip  MatterSim as we ran it\n"
+            "  mp    Materials Project's own numbers\n"
+            "They are NEVER mixed. `dft` and `mlip` are ours -- same settings, "
+            "same store. `mp` is a different scale (ours minus MP is +0.15 to "
+            "+0.21 eV/atom against a 0.06 eV/atom selection threshold), so it "
+            "is for comparing against, not for filling a gap in another hull."
+        ),
+    )
     prescreen_mode: Literal["mp_energies", "recompute"] = "mp_energies"
     prescreen_hull_max: float = Field(0.20, gt=0, description="eV/atom, widened for Phase A")
     snapshot: bool = Field(
@@ -380,8 +467,8 @@ class Reference(Base):
         ),
     )
     snapshot_id: str = Field("auto", description="'auto' = new, stamped with date + MP release")
-    cache: str = "$CSPFLOW_CACHE/mp"
-    recompute_cache: str = "$CSPFLOW_CACHE/reference"
+    cache: str = "$CSPFLOW_REFERENCE/mp"
+    recompute_cache: str = "$CSPFLOW_REFERENCE/computed"
     relax_with_mlip: bool = True
 
 
@@ -448,14 +535,35 @@ class CalibrateMP(Base):
 
 
 class CalibratePilot(Base):
-    """4b: costs pilot DFT.  OUR DFT is the yardstick.  This is the real gate.
+    """4b: costs pilot DFT.  OUR DFT is the yardstick.  OFF by default (D119).
 
-    MP phases are near in-distribution for MP-trained universal MLIPs, so 4a is
-    largely a self-consistency check.  The generated structures are the
-    out-of-distribution set.
+    It was the gate, and it was the right gate when the only calibration
+    available was 4a -- MatterSim against *MP's* numbers, which for an
+    MPtrj-trained model is largely a self-consistency check.
+
+    That is no longer the only calibration.  The reference set now carries both
+    MatterSim and our own DFT for 2,711 phases, so the comparison 4b existed to
+    make -- MLIP against OUR DFT -- is already available before a campaign
+    starts, at 68x the sample size 4b's default 40 would have given:
+
+        MatterSim vs our DFT, formation energy   MAE 0.0355 eV/atom
+                                                 median |err| 0.0148
+                                                 Spearman 0.970
+
+    So the check happens earlier and on more data, and the pilot's DFT is spent
+    on candidates instead.
+
+    **What is genuinely given up, and it is not nothing.**  Those 2,711 phases
+    are MP phases, which are near in-distribution for this class of model.  The
+    generated structures are the out-of-distribution set, and 4b was the only
+    thing that tested the model there.  Turning it on remains the honest move
+    for a campaign in a chemistry the reference set does not cover, or one whose
+    generator is asked for prototypes unlike anything in MP:
+
+        calibrate: {pilot: {on_fail: block}}
     """
 
-    on_fail: OnFail = OnFail.block
+    on_fail: OnFail = OnFail.off
     pilot_n: int = Field(40, gt=0, description="screened candidates given pilot DFT")
     thresholds: CalibratePilotThresholds = Field(default_factory=CalibratePilotThresholds)
 
@@ -534,12 +642,35 @@ class RareEarth(Base):
 
 
 class Magnetism(Base):
-    mode: Literal["none", "pymatgen", "table", "ferrimagnetic_retm"] = "ferrimagnetic_retm"
+    mode: Literal[
+        "none", "pymatgen", "table", "ferrimagnetic_retm", "ferromagnetic"
+    ] = "ferrimagnetic_retm"
     strict: bool = Field(
         True, description="fail if any site would take a default MAGMOM"
     )
     table: dict[str, float] = Field(default_factory=dict, description="element -> initial moment")
     site_overrides: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _materialise(self) -> "Magnetism":
+        """Expand a named mode into the literal table it stands for.
+
+        `recipe_id` hashes this model.  A mode NAME in the hash would record
+        that the moments came from `FERRO_RETM` but not what `FERRO_RETM` said,
+        so editing that constant would change every energy while leaving the
+        cache key -- and therefore the claim that two energies are comparable --
+        untouched.  Materialising here puts the numbers themselves in the hash:
+        change a moment, get a different recipe_id, miss the cache correctly.
+
+        Anything the user wrote in `table` wins, so an override stays an
+        override rather than being overwritten by the defaults it overrides.
+        """
+        if self.mode == "ferromagnetic":
+            from ..dft.vasp.incar import FERRO_RETM
+
+            merged = {**FERRO_RETM, **self.table}
+            object.__setattr__(self, "table", dict(sorted(merged.items())))
+        return self
 
 
 class Ldau(Base):
@@ -550,12 +681,42 @@ class Ldau(Base):
 
 
 class Select(Base):
-    """Which screened candidates get DFT, and how much they may cost."""
+    """Which screened candidates get DFT, and in what order.
+
+    `budget_core_hours` used to live here and is retired (D143). A core-hour
+    budget gates on a PROJECTION -- a per-stage mean cost multiplied by what is
+    queued -- and before any job of a stage has finished that projection is the
+    requested walltime, which is the ceiling rather than the cost. On the
+    RE-magnets campaign that made a 20,000 core-hour budget halt the run after
+    eight of 150 structures, while nothing was actually overspent. What a run
+    needs protected is the cores it holds right now, which is `dft.max_cores`
+    (D142): a measured quantity, not an extrapolation from one.
+    """
 
     rank_by: str = "e_above_hull_mlip"
     max_per_composition: int = Field(3, gt=0)
     max_total: int = Field(1500, gt=0)
-    budget_core_hours: int = Field(200_000, gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_budget(cls, data):
+        """Accept and ignore `budget_core_hours` from an older campaign.yaml.
+
+        `extra="forbid"` would make every campaign that sets it -- which is
+        every campaign written before today -- fail to load outright. Opening
+        the file and saying so is the better outcome.
+        """
+        if isinstance(data, dict) and "budget_core_hours" in data:
+            data = {k: v for k, v in data.items() if k != "budget_core_hours"}
+            warnings.warn(
+                "dft.select.budget_core_hours is retired (D143) and was "
+                "ignored. It gated on a projected cost, which before any job "
+                "finished was the requested walltime, so it halted runs that "
+                "had not overspent. Cap cores instead: dft.max_cores. "
+                "Remove it from campaign.yaml.",
+                UserWarning, stacklevel=2,
+            )
+        return data
 
 
 class Dft(Base):
@@ -574,8 +735,65 @@ class Dft(Base):
         ),
     )
     max_in_flight: int = Field(200, gt=0, description="jobs submitted at once (QOS-aware)")
-    max_concurrent_tasks: int = Field(48, gt=0, description="the --array %N throttle")
+    max_concurrent_tasks: int = Field(
+        48, gt=0,
+        description=(
+            "How many of this campaign's DFT jobs may RUN at once. It was the "
+            "`--array %N` throttle; with one job per structure (D135) there is "
+            "no array to throttle, so the site's QOS enforces it directly "
+            "(MaxTRESPU cpu=768 / ntasks=16 = 48 on orion). It still bounds "
+            "what the driver reports and, on a scheduler that models arrays, "
+            "what any remaining array submission is capped at. It can never "
+            "exceed max_in_flight: the throttle is min(concurrent, in_flight)."
+        ),
+    )
+    max_cores: int | None = Field(
+        None, gt=0,
+        description=(
+            "Total cores this campaign's DFT jobs may hold at once, counting "
+            "QUEUED as well as RUNNING. The cap people actually want: "
+            "`max_in_flight` counts JOBS, so at 64 ranks a limit of 48 is 3,072 "
+            "cores -- and nothing on this cluster's cpu role caps that. Queued "
+            "jobs count because they will occupy those cores; a cap that ignored "
+            "them would approve a submission the queue has already spent. "
+            "Only this campaign's own jobs are counted, never anyone else's. "
+            "null = no core cap (job counts alone decide)."
+        ),
+    )
     select: Select = Field(default_factory=Select)
+    layout: Literal["runs", "stages"] = Field(
+        # 'runs' IS THE DEFAULT (changed 2026-09-14, D135). It was 'stages'
+        # only because CeFeB and CePdGe were mid-flight without a `layout:`
+        # key, and re-pointing a running campaign orphans its finished work.
+        # Those campaigns are retired, so the default now matches the design
+        # rather than the transition.
+        #
+        # An old campaign is still safe: `layout.resolve()` lets the directories
+        # on disk override this, so a tree of `dft-<id>-<step>/` keeps 'stages'
+        # and says why. Configuration is an intention; the directories are a
+        # fact.
+        "runs",
+        description=(
+            "How DFT work is arranged on disk. 'runs' (the default for a new "
+            "campaign) gives each STRUCTURE one directory holding its seed, its "
+            "script, its log and one subdirectory per step. 'stages' is the older "
+            "flat arrangement -- one directory per structure per step, with the "
+            "scripts, manifests, claims and logs beside them -- which put 428 "
+            "entries at one level for a 94-structure campaign. Existing campaigns "
+            "keep 'stages'; it is not changed under a running driver."
+        ),
+    )
+    combined_job: bool = Field(
+        True,
+        description=(
+            "Run a structure's steps in ONE job instead of one job per step. "
+            "Removes the queue wait between them -- measured at 54 min median and "
+            "94 min mean over 29 CeFeB pairs, 45.7 hours of idle across those "
+            "structures alone -- and makes every array homogeneous, so a batch "
+            "can no longer mix a 24-hour relax with a 12-hour static and give "
+            "both the shorter walltime. Requires layout='runs'."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------

@@ -91,6 +91,15 @@ class LocalScheduler:
             for jid in job_ids
         }
 
+    def poll_tasks(self, job_ids: list[str]) -> dict[str, JobStatus]:
+        """The local scheduler runs work inline, so there are no array tasks.
+
+        Returning nothing is not "unknown": it says this scheduler reports no
+        task-level detail, and the driver falls back to whole-submission
+        reconciliation, which is exactly right here.
+        """
+        return {}
+
     def cancel(self, job_ids: list[str]) -> None:
         for jid in job_ids:
             prior = self._statuses.get(jid)

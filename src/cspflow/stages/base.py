@@ -45,6 +45,17 @@ class WorkItem:
     composition_ids: list[int] = field(default_factory=list)
     payload: dict[str, Any] = field(default_factory=dict)
     est_core_hours: float = 0.0
+    # Position in the submitted array, stamped by the driver.  A stage must use
+    # THIS to name its results file, never the item's position in the list it is
+    # handed: per-task reconciliation (D113) passes one item at a time, so
+    # `enumerate` would call every task 0 and read task 0's results for all of
+    # them.
+    task_index: int | None = None
+    # The tag every task in this submission shares -- `build` names the manifest
+    # and all the result files after ONE item's key, so the others cannot find
+    # their own results by their own key.  Stamped by `build`, before the claim
+    # is written.
+    group_key: str = ""
 
 
 @dataclass

@@ -100,6 +100,27 @@ class TestRecipe:
         with pytest.raises(RecipeError, match="Shipped recipes"):
             load_recipe("no-such-recipe")
 
+    def test_a_campaign_local_recipe_resolves_from_any_directory(self, tmp_path, monkeypatch):
+        """`recipe: my.yaml` means the campaign's copy, wherever you ran csp from.
+
+        The path is resolved against `base_dir`, and three call sites used to
+        omit it. They worked only when the shell happened to be sitting in the
+        campaign folder, and raised "no recipe at my.yaml" from anywhere else --
+        a failure that depends on the user's cwd, not on the campaign.
+        """
+        campaign = tmp_path / "campaign"
+        campaign.mkdir()
+        (campaign / "my.yaml").write_text(yaml.safe_dump(
+            {"name": "mine", "stages": [{"name": "relax", "incar": minimal_incar()}]}))
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        assert load_recipe("my.yaml", campaign).stage_names == ["relax"]
+        with pytest.raises(RecipeError, match="no recipe at"):
+            load_recipe("my.yaml")          # without base_dir it cannot be found
+
 
 class TestRecipeValidation:
     @pytest.mark.parametrize(
@@ -444,3 +465,298 @@ class TestAgainstTheLegacyCampaign:
         out = write_inputs(resolved, atoms, tmp_path / "job")
         for name in ("INCAR", "KPOINTS", "POSCAR", "POTCAR", "inputs.json"):
             assert (out / name).is_file(), name
+
+# --- the ferromagnetic list (D110) ------------------------------------------
+
+
+def test_ferromagnetic_covers_every_element_in_the_reference_set():
+    """`strict` refuses a default, so a gap here is 83% of the store failing.
+
+    The ferrimagnetic table covered 14 of the 27 elements the reference build
+    touches; the other 13 -- Si, Al, Ga, Y, B, C, La, Zn, Cu, N, Zr, Nb, Mo --
+    raised IncarError at input-writing time for 2,285 of 2,762 phases.
+    """
+    from cspflow.dft.vasp.incar import FERRO_RETM
+
+    reference_set = set(
+        "Al B C Ce Co Cr Cu Dy Fe Ga Gd La Mn Mo N Nb Nd Ni Pr Si Sm Tb "
+        "Ti V Y Zn Zr".split()
+    )
+    assert not reference_set - set(FERRO_RETM)
+
+
+def test_ferromagnetic_moments_are_all_positive():
+    from cspflow.dft.vasp.incar import FERRO_RETM
+
+    assert all(v > 0 for v in FERRO_RETM.values())
+
+
+def test_frozen_f_rare_earths_get_the_valence_moment_not_the_4f_one():
+    """Gd_3 has ZVAL 9 and no f in the valence: 7 muB is unrepresentable.
+
+    The legacy flow asked for it anyway -- MAGMOM -3.0 on Nd sites while using
+    Nd_3 -- and the SCF spent steps collapsing it.  0.6 is the 5d polarisation,
+    which is what the POTCAR can actually hold.
+    """
+    from cspflow.config.schema import RARE_EARTHS
+    from cspflow.dft.vasp.incar import FERRI_RETM, FERRO_RETM
+
+    # Every rare earth gets the same 1.0, because with 4f frozen they all have
+    # the same valence d shell: 5d1.  The element no longer enters the moment.
+    assert {FERRO_RETM[e] for e in RARE_EARTHS} == {1.0}
+
+    # The ferrimagnetic table is for f-in-valence and tracks the 4f count
+    # instead, so it varies right across the series -- Ce 1 through Gd/Eu 7.
+    ferri = {abs(FERRI_RETM[e]) for e in RARE_EARTHS if e in FERRI_RETM}
+    assert len(ferri) > 1 and max(ferri) == 7.0
+
+
+def test_the_ferromagnetic_table_is_materialised_into_the_hashed_config():
+    """A mode NAME in recipe_id records where moments came from, not what they
+
+    were -- so editing FERRO_RETM would change every energy while leaving the
+    cache key untouched.  The numbers themselves have to be in the hash.
+    """
+    from cspflow.config.schema import Magnetism
+    from cspflow.dft.vasp.incar import FERRO_RETM
+
+    m = Magnetism(mode="ferromagnetic")
+    assert m.table == dict(sorted(FERRO_RETM.items()))
+    assert m.model_dump()["table"]["Fe"] == 4.0
+
+
+def test_an_explicit_moment_still_beats_the_list():
+    from cspflow.config.schema import Magnetism
+
+    m = Magnetism(mode="ferromagnetic", table={"Fe": 5.0})
+    assert m.table["Fe"] == 5.0
+    assert m.table["Co"] == 3.0
+
+
+def test_changing_a_moment_changes_the_recipe_id():
+    from cspflow.config.schema import Dft, Magnetism
+    from cspflow.dft.recipe import load_recipe
+    from cspflow.reference.computed import recipe_id
+
+    recipe = load_recipe("magnets")
+    plain = recipe_id(Dft(magnetism=Magnetism(mode="ferromagnetic")), recipe)
+    tweaked = recipe_id(
+        Dft(magnetism=Magnetism(mode="ferromagnetic", table={"Fe": 5.0})), recipe
+    )
+    assert plain != tweaked
+
+
+def test_every_moment_is_the_free_atom_hund_maximum_for_the_valence_d_shell():
+    """One rule, so the list is reproducible rather than a table of guesses.
+
+    Unpaired d electrons in the free atom.  Cr and Mo are 3d5/4d5 (the s1
+    configuration); Fe 3d6 leaves four unpaired, Co 3d7 three, Ni 3d8 two.
+    A filled or absent d shell gets 0.6, not 0.0 -- a site seeded at exactly
+    zero is slow to break symmetry.
+    """
+    from cspflow.dft.vasp.incar import FERRO_RETM
+
+    unpaired_d = {
+        "Ti": 2, "V": 3, "Cr": 5, "Mn": 5, "Fe": 4, "Co": 3, "Ni": 2,
+        "Zr": 2, "Nb": 4, "Mo": 5, "Hf": 2, "Ta": 3, "W": 4, "Pt": 1,
+        "Cu": 0, "Zn": 0, "Ag": 0, "Pd": 0,
+    }
+    for element, n in unpaired_d.items():
+        expected = float(n) if n else 0.6
+        assert FERRO_RETM[element] == expected, element
+
+
+def test_the_rare_earth_moment_matches_what_zval_leaves_in_the_valence():
+    """Gd_3 is ZVAL 9 = 5s2 5p6 5d1.  One d electron, so one muB.
+
+    This is the arithmetic that makes 1.0 a derivation rather than a taste:
+    subtract the closed shells the POTCAR still carries and what remains is a
+    lone 5d electron.  It is also the right order for the induced 5d moment in
+    an RE-TM magnet, 0.3-0.5 muB, which the SCF relaxes down to.
+    """
+    from cspflow.dft.vasp.incar import FERRO_RETM
+
+    # (POTCAR ZVAL, closed-shell electrons it still carries)
+    for symbol, zval, closed in (
+        ("Gd_3", 9, 8),      # 5s2 5p6
+        ("Tb_3", 9, 8),
+        ("Dy_3", 9, 8),
+        ("Sm_3", 11, 10),    # 5s2 5p6 6s2
+        ("Nd_3", 11, 10),
+        ("La", 11, 10),
+        ("Y_sv", 11, 10),    # 4s2 4p6 5s2
+    ):
+        element = symbol.split("_")[0]
+        assert zval - closed == 1, symbol
+        assert FERRO_RETM[element] == 1.0, element
+
+
+def test_tetrahedron_falls_back_to_smearing_when_the_grid_is_too_coarse(orion):
+    """VASP ABORTS on ISMEAR=-5 with fewer than four k-points -- and does it in
+
+    the static step, after the relaxation has been paid for.  35 of the 2,746 MP
+    reference phases land there at reciprocal_density 64, 29 of them Gamma-only.
+    """
+    from ase import Atoms
+
+    from cspflow.config.schema import Dft
+    from cspflow.dft.recipe import load_recipe
+    from cspflow.dft.vasp.inputs import resolve_inputs
+
+    recipe = load_recipe("magnets")
+    static = recipe.stages[1]
+    assert str(static.incar["ISMEAR"]).strip() == "-5"
+
+    # A deliberately huge cell, so reciprocal_density 64 collapses to Gamma.
+    big = Atoms("Fe", positions=[[0, 0, 0]], cell=[40.0, 40.0, 40.0], pbc=True)
+    resolved = resolve_inputs(big, static, Dft(), orion)
+
+    assert resolved.grid.a * resolved.grid.b * resolved.grid.c < 4
+    assert str(resolved.incar["ISMEAR"]).strip() == "0"
+    assert float(str(resolved.incar["SIGMA"])) > 0
+    assert any("tetrahedron" in w.lower() for w in resolved.warnings)
+
+
+def test_a_dense_enough_grid_keeps_the_tetrahedron_method(orion):
+    from ase import Atoms
+
+    from cspflow.config.schema import Dft
+    from cspflow.dft.recipe import load_recipe
+    from cspflow.dft.vasp.inputs import resolve_inputs
+
+    static = load_recipe("magnets").stages[1]
+    small = Atoms("Fe", positions=[[0, 0, 0]], cell=[2.87, 2.87, 2.87], pbc=True)
+    resolved = resolve_inputs(small, static, Dft(), orion)
+
+    assert resolved.grid.a * resolved.grid.b * resolved.grid.c >= 4
+    assert str(resolved.incar["ISMEAR"]).strip() == "-5"
+
+
+def test_the_tetrahedron_guard_counts_irreducible_kpoints_not_the_grid_product(orion):
+    """A grid product over the limit can still fold below it, and VASP aborts.
+
+    Found live 2026-09-10: `mp-1192814-Ce3Si3Pd102` was written with ISMEAR=-5
+    on a 2x2x2 grid -- product 8, comfortably over the minimum of 4 -- and VASP
+    stopped in the static step with
+
+        VERY BAD NEWS! internal error in subroutine BZINTS:
+        Tetrahedron method fails (number of k-points < 4) 3
+
+    because symmetry folds that mesh to THREE irreducible points. Four
+    structures failed this way, all of them waved through by a guard that
+    multiplied the grid dimensions instead of asking spglib.
+    """
+    from ase import Atoms
+
+    from cspflow.config.schema import Dft
+    from cspflow.dft.recipe import load_recipe
+    from cspflow.dft.vasp.inputs import resolve_inputs
+    from cspflow.dft.vasp.parallel import irreducible_kpoints
+
+    static = load_recipe("magnets").stages[1]
+    # High symmetry is what makes the two counts disagree: a simple cubic cell
+    # on a 2x2x2 mesh folds to far fewer than eight points.
+    cubic = Atoms("Fe", positions=[[0, 0, 0]], cell=[6.0, 6.0, 6.0], pbc=True)
+    resolved = resolve_inputs(cubic, static, Dft(), orion)
+
+    product = resolved.grid.a * resolved.grid.b * resolved.grid.c
+    folded = irreducible_kpoints(
+        resolved.atoms.cell[:], resolved.atoms.get_scaled_positions(),
+        resolved.atoms.get_atomic_numbers(),
+        (resolved.grid.a, resolved.grid.b, resolved.grid.c),
+    )
+    if folded is None:
+        import pytest
+        pytest.skip("spglib absent: the guard falls back to the grid product")
+
+    # The point of the test: when they disagree, the DECISION follows the
+    # folded count.  Asserting on the product would restate the old bug.
+    if folded < 4:
+        assert str(resolved.incar["ISMEAR"]).strip() == "0", (
+            f"grid product {product} passed the guard but the mesh folds to "
+            f"{folded} irreducible points -- VASP would abort here"
+        )
+        assert any("irreducible" in w for w in resolved.warnings)
+    else:
+        assert str(resolved.incar["ISMEAR"]).strip() == "-5"
+
+
+class TestCarryingTheGridAcrossAResume:
+    """A resumed relaxation must keep the sampling it was already running.
+
+    The grid is floor(mult / length), so a cell that drifts across an integer
+    boundary re-derives a different grid on resume and the run then minimises a
+    different energy surface from the one its starting geometry was nearly
+    converged on. Numbers below are structure 2498 of RE-magnets-CHGNet.
+    """
+
+    def test_the_real_case_that_found_this(self):
+        from cspflow.dft.recipe import Kpoints
+        from cspflow.dft.vasp.kpoints import carry_grid, grid_for
+
+        started = [8.6786, 8.6786, 12.5437]      # attempt 0 started here
+        reached = [8.6222, 8.6225, 12.6264]      # ... and relaxed to here
+        density = Kpoints(scheme="reciprocal_density", value=64)
+
+        first = grid_for(started, density)
+        derived = grid_for(reached, density)
+        assert (first.a, first.b, first.c) == (2, 2, 2)
+        assert (derived.a, derived.b, derived.c) == (2, 2, 1), (
+            "0.66% of c-axis relaxation crossed the mult/2 = 12.5664 A boundary")
+
+        carried = carry_grid(first, reached, reached)
+        assert (carried.a, carried.b, carried.c) == (2, 2, 2)
+
+    def test_a_niggli_axis_permutation_is_followed(self):
+        from cspflow.dft.vasp.kpoints import KpointGrid, carry_grid
+
+        previous = KpointGrid(4, 2, 6, scheme="reciprocal_density")
+        source = [5.0, 9.0, 3.0]
+        canonical = [3.0, 5.0, 9.0]              # c, a, b
+        carried = carry_grid(previous, source, canonical)
+        assert (carried.a, carried.b, carried.c) == (6, 4, 2)
+
+    def test_a_basis_that_is_not_a_permutation_refuses(self):
+        from cspflow.dft.vasp.kpoints import KpointGrid, carry_grid
+
+        previous = KpointGrid(4, 4, 2, scheme="reciprocal_density")
+        assert carry_grid(previous, [5.0, 5.0, 9.0], [5.0, 5.0, 7.1]) is None
+
+    def test_resolve_inputs_uses_the_carried_grid_and_says_so(self, orion):
+        from ase import Atoms
+
+        from cspflow.config.schema import Dft
+        from cspflow.dft.recipe import load_recipe
+        from cspflow.dft.vasp.inputs import resolve_inputs
+        from cspflow.dft.vasp.kpoints import KpointGrid
+
+        relax = load_recipe("magnets").stages[0]
+        cell = Atoms("Fe", positions=[[0, 0, 0]], cell=[2.87, 2.87, 2.87],
+                     pbc=True)
+
+        plain = resolve_inputs(cell, relax, Dft(), orion)
+        coarser = KpointGrid(plain.grid.a - 1, plain.grid.b, plain.grid.c,
+                             scheme="reciprocal_density")
+
+        resumed = resolve_inputs(cell, relax, Dft(), orion, carried_grid=coarser)
+        assert (resumed.grid.a, resumed.grid.b, resumed.grid.c) == (
+            coarser.a, coarser.b, coarser.c)
+        assert any("carried from the previous attempt" in w
+                   for w in resumed.warnings)
+
+    def test_a_carried_grid_that_agrees_is_not_worth_a_warning(self, orion):
+        from ase import Atoms
+
+        from cspflow.config.schema import Dft
+        from cspflow.dft.recipe import load_recipe
+        from cspflow.dft.vasp.inputs import resolve_inputs
+
+        relax = load_recipe("magnets").stages[0]
+        cell = Atoms("Fe", positions=[[0, 0, 0]], cell=[2.87, 2.87, 2.87],
+                     pbc=True)
+
+        plain = resolve_inputs(cell, relax, Dft(), orion)
+        resumed = resolve_inputs(cell, relax, Dft(), orion,
+                                 carried_grid=plain.grid)
+        assert resumed.settings_hash == plain.settings_hash
+        assert not any("carried" in w for w in resumed.warnings)

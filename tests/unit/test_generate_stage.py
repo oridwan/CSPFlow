@@ -288,7 +288,7 @@ def test_build_writes_a_manifest_the_worker_can_read(cfg, store, tmp_path):
     assert spec.array_size == len(items)
     assert spec.gpus == 1
     assert "generate-worker" in spec.command
-    manifest = json.loads(next((tmp_path / "jobs").glob("*.manifest.json")).read_text())
+    manifest = json.loads(next((tmp_path / "jobs").rglob("inputs.json")).read_text())
     assert len(manifest["chunks"]) == len(items)
     assert manifest["max_batch_size"] == 100
     assert manifest["model"] == str(cfg.campaign.generate.mattergen.model)
@@ -308,7 +308,7 @@ def test_the_worker_runs_a_chunk_end_to_end(cfg, store, tmp_path, fake_mattergen
     stage = GenerateStage(cfg, group=10)
     items = stage.claim(store, budget=10)
     stage.build(items, tmp_path / "jobs")
-    manifest = next((tmp_path / "jobs").glob("*.manifest.json"))
+    manifest = next((tmp_path / "jobs").rglob("inputs.json"))
 
     out = run_generate_task(manifest, task_id=0)
     payload = json.loads(out.read_text())
@@ -322,7 +322,7 @@ def test_the_worker_refuses_a_task_id_the_manifest_has_no_chunk_for(cfg, store,
     add_comps(store, [("Fe2Sm1", 1, 3, 4)])
     stage = GenerateStage(cfg)
     stage.build(stage.claim(store, budget=1), tmp_path / "jobs")
-    manifest = next((tmp_path / "jobs").glob("*.manifest.json"))
+    manifest = next((tmp_path / "jobs").rglob("inputs.json"))
     with pytest.raises(WorkerError, match="no chunk"):
         run_generate_task(manifest, task_id=7)
 
@@ -336,7 +336,7 @@ def test_the_worker_checks_the_cell_size_against_the_composition_row(cfg, store,
                           n_target=4, source_mode="composition_list", source_name="hand")
     stage = GenerateStage(cfg)
     stage.build(stage.claim(store, budget=1), tmp_path / "jobs")
-    manifest = next((tmp_path / "jobs").glob("*.manifest.json"))
+    manifest = next((tmp_path / "jobs").rglob("inputs.json"))
     with pytest.raises(WorkerError, match="atoms but the composition row says"):
         run_generate_task(manifest, task_id=0)
 
@@ -347,7 +347,7 @@ def test_the_worker_refuses_before_loading_a_model_it_cannot_use(cfg, store, tmp
     add_comps(store, [("Fe2Sm1", 1, 3, 4)])
     stage = GenerateStage(cfg)
     stage.build(stage.claim(store, budget=1), tmp_path / "jobs")
-    manifest = next((tmp_path / "jobs").glob("*.manifest.json"))
+    manifest = next((tmp_path / "jobs").rglob("inputs.json"))
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     with pytest.raises(WorkerError, match="preflight failed"):
         run_generate_task(manifest, task_id=0)
@@ -367,7 +367,7 @@ def test_reconcile_ingests_structures_and_records_the_yield(cfg, store, tmp_path
     items = stage.claim(store, budget=10)
     workdir = tmp_path / "jobs"
     stage.build(items, workdir)
-    run_generate_task(next(workdir.glob("*.manifest.json")), task_id=0)
+    run_generate_task(next(workdir.rglob("inputs.json")), task_id=0)
 
     row, status = done(1, workdir)
     stage.reconcile(store, row, status, items)
@@ -381,6 +381,40 @@ def test_reconcile_ingests_structures_and_records_the_yield(cfg, store, tmp_path
                                         "produced": 8, "short": 0}
 
 
+def test_one_task_handed_back_alone_reads_its_own_results_file(cfg, store, tmp_path,
+                                                               fake_mattergen):
+    """Per-task reconciliation hands over ONE item; it must not read task 0.
+
+    The driver frees each array task as it ends (D113), so `items` is a
+    one-element list carrying its own `task_index`.  A stage that derived the
+    index from the list position would open task 0's results for every task:
+    the first task's compositions would be written repeatedly and every other
+    task's would be failed as "produced no results" while its structures sat
+    finished on disk (D121).
+    """
+    add_comps(store, [("Fe2Sm1", 1, 3, 4), ("Co5Sm1", 1, 6, 4)])
+    stage = GenerateStage(cfg, group=1)
+    items = stage.claim(store, budget=10)
+    assert len(items) == 2
+    mine = items[1].composition_ids[0]        # what array task 1 actually holds
+    theirs = items[0].composition_ids[0]
+    workdir = tmp_path / "jobs"
+    stage.build(items, workdir)
+    manifest = next(workdir.rglob("inputs.json"))
+    run_generate_task(manifest, task_id=0)
+    run_generate_task(manifest, task_id=1)
+
+    # exactly what the driver passes for array task 1
+    items[1].task_index = 1
+    row, status = done(1, workdir)
+    stage.reconcile(store, row, status, [items[1]])
+
+    task1 = next(c for c in store.compositions() if c.id == mine)
+    task0 = next(c for c in store.compositions() if c.id == theirs)
+    assert task1.state == "generated" and task1.n_produced == 4
+    assert task0.state == "generating", "task 0 must not have been touched"
+
+
 def test_reconcile_records_a_shortfall_without_calling_it_a_failure(cfg, store,
                                                                     tmp_path,
                                                                     fake_mattergen,
@@ -391,7 +425,7 @@ def test_reconcile_records_a_shortfall_without_calling_it_a_failure(cfg, store,
     workdir = tmp_path / "jobs"
     stage.build(items, workdir)
     monkeypatch.setenv("FAKE_MATTERGEN_MODE", "short")
-    run_generate_task(next(workdir.glob("*.manifest.json")), task_id=0)
+    run_generate_task(next(workdir.rglob("inputs.json")), task_id=0)
 
     row, status = done(1, workdir)
     stage.reconcile(store, row, status, items)

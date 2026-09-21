@@ -4,8 +4,26 @@
 #   Hydrus (1) | DTN (2)
 scheduler: slurm
 
+# The CPU pool is heterogeneous and the VASP build is not portable across it.
+# `vasp_std` carries 5,285 AVX-512 (zmm) instructions, so it dies instantly with
+# `forrtl: severe (168): illegal instruction` on any node without AVX-512 -- no
+# OUTCAR, no vasprun.xml, nothing to diagnose from except the node name.
+# Orion/Apus hold 12 such nodes: 10 EPYC Rome (Zen 2, str-c88..c97), 1 Milan
+# (Zen 3) and 1 Broadwell.  Measured 2026-09-09: 21 of 21 DFT failures were on
+# Rome, 0 on anything else.
+#
+# This is an ALLOW-list of AVX-512-capable features rather than a deny-list of
+# node names, so a newly added architecture is simply not used instead of
+# crashing every job that lands on it.
 partitions:
-  cpu:        {name: "Orion,Apus"}
+  # Allow-list, not a deny-list: a new architecture nobody has checked is
+  # excluded until someone does, which is the safe direction.  Every feature
+  # here was verified to carry avx512f with a live lscpu probe on 2026-09-09;
+  # `skylake` is Nebula's Xeon Gold 6154, which has it, and is listed so that
+  # adding Nebula to `cpu` does not silently exclude the whole partition.
+  # Missing on purpose: rome, milan, broadwell -- none have AVX-512, and
+  # vasp_std has 5,285 AVX-512 instructions.
+  cpu:        {name: "Orion,Apus", constraint: "caslake|genoa|turin|skylake|sapphire_rapids"}
   gpu:        {name: "GPU"}
   bigmem:     {name: "Hydrus"}
   short:      {name: "Nebula"}
@@ -50,14 +68,14 @@ env:
   I_MPI_PMI_LIBRARY: /usr/lib64/libpmi.so.0
 
 codes:
-  vasp_std: /projects/mmi/Ridwan/potcarFiles/VASP6.4/vasp.6.4.3/bin/vasp_std
+  vasp_std: /projects/mmi/cspflow-shared/vasp/bin/vasp_std
   mpi_launcher: "srun --mpi=pmi2"
 
 # pymatgen expects functional labels to map to specific directory NAMES, which
 # the raw potpaw_PBE trees do not use.  `csp doctor --fix` creates this
 # symlink layout; without it `functional: PBE_64` silently falls back to a
 # flat-layout match and the label misdescribes what is actually on disk.
-potcar_root: /projects/mmi/Ridwan/potcarFiles/pmg
+potcar_root: /projects/mmi/cspflow-shared/potcars/pmg
 potcar_dirs:
   PBE_64: POT_PAW_PBE_64          # -> VASP6.4/potpaw_PBE
   PBE_52: POT_GGA_PAW_PBE_52      # -> VASP5.2/potpaw_PBE

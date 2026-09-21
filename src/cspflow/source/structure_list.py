@@ -314,36 +314,165 @@ def _dedup_within_set(result: SourceResult, policy: str) -> None:
     and an unrelaxed copy of one prototype, or two settings of the same cell,
     would be silently merged and you would never learn which one survived.
     """
-    if len(result.structures) < 2:
+    if policy == "off" or len(result.structures) < 2:
         return
 
-    matcher = _structure_matcher()
     by_formula: dict[str, list[int]] = {}
     for i, s in enumerate(result.structures):
         by_formula.setdefault(s.formula, []).append(i)
 
-    drop: set[int] = set()
+    pairs: list[tuple[str, int, int]] = []
     for formula, indices in by_formula.items():
-        if len(indices) < 2:
-            continue
         for pos, i in enumerate(indices):
-            if i in drop:
-                continue
             for j in indices[pos + 1:]:
-                if j in drop or not _same_structure(result.structures[i],
-                                                    result.structures[j], matcher):
-                    continue
-                a, b = result.structures[i].path, result.structures[j].path
-                if policy == "drop":
-                    drop.add(j)
-                    result.warnings.append(f"{b} duplicates {a} ({formula}); dropped")
-                else:
-                    result.warnings.append(
-                        f"{b} is structurally the same as {a} ({formula}); BOTH kept "
-                        f"(dedup: warn). Set dedup: drop if that is not what you want."
-                    )
+                pairs.append((formula, i, j))
+    if not pairs:
+        return
+
+    verdict = _compare_pairs(result.structures, pairs)
+
+    drop: set[int] = set()
+    for formula, i, j in pairs:
+        if i in drop or j in drop or not verdict[(i, j)]:
+            continue
+        a, b = result.structures[i].path, result.structures[j].path
+        if policy == "drop":
+            drop.add(j)
+            result.warnings.append(f"{b} duplicates {a} ({formula}); dropped")
+        else:
+            result.warnings.append(
+                f"{b} is structurally the same as {a} ({formula}); BOTH kept "
+                f"(dedup: warn). Set dedup: drop, or dedup: off to skip the "
+                f"comparison entirely, if that is not what you want."
+            )
     if drop:
         result.structures = [s for i, s in enumerate(result.structures) if i not in drop]
+
+
+# Below this many pairs, a process pool costs more to start than it saves.
+_PARALLEL_MIN_PAIRS = 16
+_MAX_WORKERS = 16
+
+
+def _reduce_one(struct):
+    """The primitive+Niggli reduction StructureMatcher would do internally.
+
+    Hoisted out so it happens once per structure instead of once per pair --
+    see `_compare_pairs`.  Module level so a process pool can pickle it.
+    """
+    from pymatgen.analysis.structure_matcher import StructureMatcher
+
+    try:
+        return StructureMatcher._get_reduced_structure(
+            struct, primitive_cell=True, niggli=True)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def _fit_pair(args):
+    """One comparison between two ALREADY-REDUCED structures.
+
+    `primitive_cell=False` because the reduction has been done: with it left at
+    the default True, the matcher redoes it on both sides of every pair.
+    Measured on 739 CePdGe pairs, the two give identical verdicts (61 matches
+    either way) and this is 2.4x faster.
+    """
+    a, b = args
+    if a is None or b is None:
+        return False
+    from pymatgen.analysis.structure_matcher import StructureMatcher
+
+    try:
+        return bool(StructureMatcher(primitive_cell=False).fit(a, b))
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def _worker_count(n_tasks: int) -> int:
+    """How many processes we may actually use.
+
+    `os.cpu_count()` reports the MACHINE, not the allocation. On the Orion login
+    node it says 48 while the cgroup permits 2, and under `sbatch
+    --cpus-per-task=N` it reports the whole node. Oversubscribing a 2-core
+    cpuset with 16 workers is slower than staying serial.
+    `sched_getaffinity` is the number actually schedulable.
+    """
+    import os
+
+    try:
+        usable = len(os.sched_getaffinity(0))
+    except AttributeError:                                     # pragma: no cover
+        usable = os.cpu_count() or 1
+    return max(1, min(n_tasks, usable, _MAX_WORKERS))
+
+
+def _compare_pairs(structures, pairs) -> dict[tuple[int, int], bool]:
+    """Decide `same structure?` for every candidate pair.
+
+    Two things make this worth its own function rather than a nested loop.
+
+    **Convert each structure ONCE.**  The comparison used to call
+    `AseAtomsAdaptor.get_structure` on both sides of every pair, so a seed in a
+    group of 14 was converted 13 times over.  232 CePdGe seeds meant 1,478
+    conversions where 232 would do.
+
+    **Reduce each structure ONCE too.**  `StructureMatcher.fit` with its default
+    `primitive_cell=True` re-derives the primitive, Niggli-reduced cell of BOTH
+    inputs on every call, so a seed in a 14-member group had its reduction
+    recomputed 13 times.  Hoisting it out and comparing with
+    `primitive_cell=False` gives identical verdicts -- 61 matches either way on
+    the 739 CePdGe pairs -- and is 2.4x faster on its own (139 s -> 58 s).  That
+    is a bigger win than the parallelism below, and the two multiply.
+
+    **Run what is left in parallel.**  The fits are independent and pure, so
+    they parallelise exactly; the drop bookkeeping stays sequential afterwards,
+    which keeps the result and the warning order identical to the serial
+    version.
+
+    Falls back to serial silently -- a login node with no spare cores, or a
+    pool that cannot start, must still produce the right answer.
+    """
+    from pymatgen.io.ase import AseAtomsAdaptor
+
+    verdict: dict[tuple[int, int], bool] = {}
+    todo: list[tuple[int, int]] = []
+    for _formula, i, j in pairs:
+        # An identical file is identical; no geometry comparison needed.
+        if structures[i].content_hash == structures[j].content_hash:
+            verdict[(i, j)] = True
+        else:
+            todo.append((i, j))
+    if not todo:
+        return verdict
+
+    wanted = sorted({i for pair in todo for i in pair})
+    try:
+        converted = [AseAtomsAdaptor.get_structure(structures[i].atoms) for i in wanted]
+    except Exception:                                          # noqa: BLE001
+        for pair in todo:
+            verdict[pair] = False
+        return verdict
+
+    workers = _worker_count(max(len(wanted), len(todo)))
+    parallel = workers > 1 and len(todo) >= _PARALLEL_MIN_PAIRS
+
+    def _map(fn, items):
+        """Pool if it is worth it and it works; serial otherwise, same answer."""
+        if parallel:
+            try:
+                from concurrent.futures import ProcessPoolExecutor
+
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    return list(pool.map(fn, items, chunksize=1))
+            except Exception:                                  # noqa: BLE001
+                pass
+        return [fn(x) for x in items]
+
+    reduced = dict(zip(wanted, _map(_reduce_one, converted)))
+    results = _map(_fit_pair, [(reduced[i], reduced[j]) for i, j in todo])
+
+    verdict.update(dict(zip(todo, results)))
+    return verdict
 
 
 def _structure_matcher():
@@ -369,8 +498,29 @@ def _same_structure(a: EmittedStructure, b: EmittedStructure, matcher) -> bool:
 
 
 def _sha256(path: Path) -> str:
+    """A content hash that ASE will accept as a key_value_pair.
+
+    The `sha256:` prefix is not decoration. A bare 16-character hex digest is
+    number-like roughly once in 600 -- every digit, or digits-e-digits -- and ASE
+    refuses any string key_value_pair that `float()` or `int()` would parse,
+    because such a value would come back from the database as a number:
+
+        ValueError: Value 35720269025179e3 is put in as string but can be
+        interpreted as float!
+
+    Measured on a 14,777-seed campaign: 23 seeds produced a rejected digest
+    (e.g. `35720269025179e3`, `4516549686969335`), and the source stage died on
+    the first of them AFTER `--dry-run` had reported success -- the dry run never
+    writes, so it cannot see this. A 92-seed campaign hits it about once in seven
+    runs, which is how it survived CeFeB and CePdGe.
+
+    The prefix makes the value unparseable as a number by construction rather
+    than by luck, and says what the digest is. It is provenance only: nothing
+    queries content_hash back out of the database, and comparisons are within a
+    single run, so the format is free to change.
+    """
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
-    return h.hexdigest()[:16]
+    return "sha256:" + h.hexdigest()[:16]

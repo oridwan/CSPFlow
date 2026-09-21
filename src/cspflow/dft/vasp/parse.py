@@ -27,6 +27,12 @@ _OSZICAR_IONIC = re.compile(
     r"^\s*(\d+)\s+F=\s*([-.\dE+]+)\s+E0=\s*([-.\dE+]+)(?:.*?mag=\s*([-.\dE+]+))?",
     re.MULTILINE,
 )
+# One SCF iteration. VASP names the line after the algorithm in use -- DAV for
+# blocked Davidson, RMM for RMM-DIIS, CG for conjugate gradient -- and ALGO=Fast
+# switches between them mid-run, so the name is matched loosely and only the
+# iteration NUMBER is read.
+_OSZICAR_ELECTRONIC = re.compile(r"^\s*([A-Z]{2,5}):\s+(\d+)\s", re.MULTILINE)
+
 _INCAR_TAG = re.compile(r"^\s*([A-Z_]+)\s*=\s*(.+?)\s*(?:[#!].*)?$", re.MULTILINE)
 
 
@@ -57,6 +63,11 @@ class OszicarResult:
     energy: float | None       # F=  (free energy)
     e0: float | None           # E0= (energy with sigma->0; what we store)
     magnetisation: float | None
+    # SCF iterations in the LAST ionic step. Compared against NELM, this is the
+    # only evidence that a static's energy is converged -- a static has no force
+    # criterion, so nothing else in the file distinguishes a converged answer
+    # from one VASP gave up on. See read_job_directory.
+    n_electronic_steps: int | None = None
 
 
 def read_oszicar(path: Path) -> OszicarResult:
@@ -69,17 +80,20 @@ def read_oszicar(path: Path) -> OszicarResult:
     than left to whichever the caller happens to grab.
     """
     if not path.is_file():
-        return OszicarResult(0, None, None, None)
+        return OszicarResult(0, None, None, None, None)
     text = tail_text(path)
     matches = _OSZICAR_IONIC.findall(text)
+    electronic = _OSZICAR_ELECTRONIC.findall(text)
+    n_elec = int(electronic[-1][1]) if electronic else None
     if not matches:
-        return OszicarResult(0, None, None, None)
+        return OszicarResult(0, None, None, None, n_elec)
     step, f_energy, e0, mag = matches[-1]
     return OszicarResult(
         n_ionic_steps=int(step),
         energy=float(f_energy),
         e0=float(e0),
         magnetisation=float(mag) if mag else None,
+        n_electronic_steps=n_elec,
     )
 
 
@@ -107,11 +121,26 @@ def read_outcar_status(path: Path) -> OutcarStatus:
     m = re.search(r"Elapsed time \(sec\):\s*([\d.]+)", text)
     if m:
         elapsed = float(m.group(1))
-    # NIONS is in the header, not the epilogue.
+    # NIONS is in the header, not the epilogue -- but HOW FAR into the header
+    # depends on the chemistry. VASP echoes each POTCAR block twice, so a
+    # ternary with verbose pseudopotentials pushes NIONS past a small window.
+    #
+    # Found 2026-09-15: in mp-4459 (Ce2Fe14B, PAW_PBE Ce_3 / Fe_pv / B) NIONS
+    # sits at byte 40,335 -- 335 bytes past the old fixed 40,000-byte read. It
+    # parsed as None, so `e_per_atom` was never derived, and the row went into
+    # index.csv with an energy but no per-atom energy. 65 phases were affected,
+    # nearly all of them the R2Fe14B / R2Co14B / R2Fe14C family -- exactly the
+    # competing phases a 2:14:1 hull needs. A hull built on `e_per_atom_eV`
+    # silently omitted them, and omitted the parent compound itself.
+    #
+    # So: keep the cheap 40 KB read as the fast path, and widen only when that
+    # misses. 1 MB is still far less than a 26 MB OUTCAR.
     n_atoms = None
-    m = re.search(r"NIONS\s*=\s*(\d+)", head_text(path))
-    if m:
-        n_atoms = int(m.group(1))
+    for window in (40_000, 1_000_000):
+        m = re.search(r"NIONS\s*=\s*(\d+)", head_text(path, window))
+        if m:
+            n_atoms = int(m.group(1))
+            break
     return OutcarStatus(True, finished, converged, n_atoms, elapsed)
 
 
@@ -205,7 +234,25 @@ def read_job_directory(directory: Path) -> JobOutcome:
     # Found live: a `static` step reported 200 ionic steps and converged=False,
     # having been retried once already.
     static = (nsw is not None and nsw <= 0) or ibrion == -1
-    converged = outcar.converged or (static and outcar.finished)
+
+    # But "finished" is not the substitute criterion, and using it as one was
+    # D151. `outcar.finished` means VASP wrote its epilogue -- a statement about
+    # the process, which the docstring at the top of this file exists to keep
+    # apart from the physics. A static whose SCF ran out at NELM writes that
+    # epilogue exactly like a converged one, so EVERY static in the
+    # RE-magnets-CHGNet campaign read as converged: 2,245 of 2,245 rows, with
+    # 149 of the 2,039 runs on disk having actually stopped at NELM.
+    #
+    # The evidence a static does leave is electronic: an SCF that converged
+    # stopped below NELM, and one VASP gave up on hit it exactly. That test also
+    # belongs on a relax -- an ionically converged step whose final SCF did not
+    # converge is not a usable energy either -- so it is applied to both, as a
+    # requirement rather than a replacement.
+    nelm = incar_int(incar, "NELM")
+    n_elec = oszicar.n_electronic_steps
+    scf_converged = not (nelm and n_elec and n_elec >= nelm)
+
+    converged = (outcar.converged or (static and outcar.finished)) and scf_converged
 
     if not outcar.exists:
         state, reason = "failed", "no OUTCAR"
@@ -214,6 +261,9 @@ def read_job_directory(directory: Path) -> JobOutcome:
         state, reason = "timeout", "OUTCAR has no epilogue (killed mid-run)"
     elif converged:
         state, reason = "done", ""
+    elif not scf_converged:
+        # Names the rung that fits: ALGO/NELM, not more ionic steps.
+        state, reason = "done", "scf_not_converged"
     elif nsw is not None and oszicar.n_ionic_steps >= nsw:
         state, reason = "done", "ionic_step_limit"
     else:
@@ -243,3 +293,81 @@ def read_job_directory(directory: Path) -> JobOutcome:
         exit_reason=reason,
         potcar_symbols=read_potcar_symbols(directory / "POTCAR"),
     )
+
+
+# --------------------------------------------------------------------------
+# Do two steps of one structure describe the same calculation?
+# --------------------------------------------------------------------------
+
+# A static that lands in a different magnetic state from the relaxation that
+# produced its geometry is the failure this measures. The static starts its SCF
+# from the MAGMOM guess again -- no WAVECAR, no CHGCAR -- so it re-finds the
+# magnetic solution from scratch and can settle somewhere else. The geometry is
+# then optimised in one state and the energy reported for another; neither
+# number is wrong alone, and the pair is not a result.
+#
+# Measured over 2,067 structures of RE-magnets-CHGNet whose relax converged:
+#
+#   |relax -> static shift| > 60 meV/atom : 41 of 46 changed moment (89%)
+#   |relax -> static shift| <= 5 meV/atom : 50 of 1753 changed moment (3%)
+#
+# 0.1 uB/atom is where those two populations separate. 60 meV/atom is the
+# campaign's own selection threshold -- below it the shift cannot change a
+# ranking decision, so flagging it would be noise. The worst seen were
+# structure 13836 (-2.7 -> +4.1 uB) and structure 4470 (-8.8 -> +12.0 uB).
+ENERGY_SHIFT_MEV_PER_ATOM = 60.0
+MAGMOM_SHIFT_PER_ATOM = 0.1
+
+
+@dataclass(frozen=True)
+class StepConsistency:
+    """How far a step moved from the one whose geometry it inherited."""
+
+    energy_shift: float | None       # meV/atom, static minus previous
+    magmom_shift: float | None       # uB/atom, absolute
+    ok: bool
+    detail: str
+
+    @property
+    def measurable(self) -> bool:
+        return self.energy_shift is not None
+
+
+def step_consistency(previous, current,
+                     energy_limit: float = ENERGY_SHIFT_MEV_PER_ATOM,
+                     magmom_limit: float = MAGMOM_SHIFT_PER_ATOM) -> StepConsistency:
+    """Compare a step against the step whose relaxed geometry it started from.
+
+    Both arguments are `JobOutcome`s. Returns `ok=True` when nothing can be
+    measured: a missing number is not evidence of a problem, and a gate that
+    fails on absent data teaches people to ignore it.
+    """
+    n_atoms = current.n_atoms or previous.n_atoms
+    if previous.e_per_atom is None or current.e_per_atom is None:
+        return StepConsistency(None, None, True, "")
+
+    shift = (current.e_per_atom - previous.e_per_atom) * 1000.0
+
+    dmag = None
+    if (previous.magnetisation is not None and current.magnetisation is not None
+            and n_atoms):
+        dmag = abs(current.magnetisation - previous.magnetisation) / n_atoms
+
+    if abs(shift) <= energy_limit:
+        return StepConsistency(shift, dmag, True, "")
+
+    # Over the limit. Name the likely cause rather than only the symptom -- the
+    # moment is what a person would check next, and it is already in hand.
+    if dmag is not None and dmag > magmom_limit:
+        detail = (f"energy moved {shift:+.0f} meV/atom and the moment moved "
+                  f"{dmag:.2f} uB/atom ({previous.magnetisation:+.2f} -> "
+                  f"{current.magnetisation:+.2f} uB total): the two steps "
+                  f"settled in different magnetic states, so the geometry and "
+                  f"the energy do not describe the same calculation")
+    elif dmag is not None:
+        detail = (f"energy moved {shift:+.0f} meV/atom with the moment steady "
+                  f"({dmag:.2f} uB/atom): not a magnetic flip -- check the "
+                  f"k-mesh and ISMEAR difference between the two steps")
+    else:
+        detail = f"energy moved {shift:+.0f} meV/atom; no moment recorded"
+    return StepConsistency(shift, dmag, False, detail)

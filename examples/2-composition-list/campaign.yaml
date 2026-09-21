@@ -1,167 +1,145 @@
 # ===========================================================================
-#  EXAMPLE 2 of 3 -- source mode: composition_list
+#  EXAMPLE 2 of 3 -- campaign type 2: composition_list
 #
 #  "I know which formulas I want."  No enumeration: you give the list, cspflow
 #  generates structures for exactly those and nothing else. Same funnel from
-#  Stage 1 on -- generate, screen, dedup, hull, filter, DFT.
+#  there on -- generate, screen, dedup, hull, filter, DFT.
 #
 #  Two ways to give the list, and this example uses BOTH at once:
 #    inline `items:`   a handful you are looking at while you edit
 #    `from_file:`      a CSV you maintain separately (inputs/compositions.csv)
-#  They are concatenated. Use inline for exceptions, the file for the bulk.
+#  Inline items are read first; a formula in both warns and keeps the inline
+#  one. So the file is the list you maintain, the items are today's exceptions.
 #
-#  Copy this folder, or:  csp init my-shortlist -m orion
+#  Start your own from this file:   csp init 2 my-shortlist
+#
+#  How to read it: every line that is not a comment is a live setting, written
+#  out even where it equals the default. Where a setting takes one of a fixed
+#  set of values, the others are listed beside it as  # a | b | c  (pick ONE).
+#  Where a setting takes SEVERAL at once, the comment starts  # several:
+#  and shows the comma-separated form, e.g.  [Sm, Nd, Pr]  or  {Sm: Sm_3, Ti: Ti_pv}.
 # ===========================================================================
 
 name: example-shortlist
-machine: orion
-workdir: /scratch/$USER/cspflow/example-shortlist
-archive: /projects/mmi/Ridwan/cspflow_archive/example-shortlist
+machine: machine.yaml            # this folder's copy | orion | generic_slurm | local | any path
+workdir: results                 # beside this file; an absolute path puts output elsewhere
 
 # ---------------------------------------------------------------------------
-# SOURCE
+# SOURCE -- what to search
 # ---------------------------------------------------------------------------
 source:
-  - mode: composition_list
-    name: shortlist
+  - mode: composition_list       # this file's type; `csp init 1|2|3` starts another
+    name: shortlist              # stamped on every row; needed once there are 2+ sources
     composition_list:
-
-      # Inline items. Every field except `formula` is optional and falls back
-      # to `defaults` below, so a bare {formula: X} is a complete entry.
-      #
-      # Inline items are read BEFORE the file, and a formula that appears in
-      # both warns and keeps the first. So inline is the override: the file is
-      # the list you maintain, these are the exceptions you are making today.
-      items:
-
-        # An override. inputs/compositions.csv also has SmFe11Ti, at 120
-        # structures; this entry wins and the run warns that it did.
-        - formula: SmFe11Ti    # the reduced formula
-          z: {min: 1, max: 1}  # or the shorthand  z: [1, 1]
-          max_atoms: 26        # z * 13 atoms
+      # Every field except `formula` is optional and falls back to `defaults`.
+      items:                     # several: one "- formula:" entry each
+        - formula: SmFe11Ti      # also in the CSV at 120 structures; this entry wins, with a warning
+          z: [1, 1]              # [min, max]
+          max_atoms: 26          # z * 13 atoms
           n_structures:
-            mode: fixed        # fixed | per_atom
-            count: 150         # spend more on the phase you care most about
-
-        # The 3:29 phase -- not in the file, being tried for the first time.
-        - formula: Sm3Fe29Ti2
-          z: [1, 1]            # 34 atoms/f.u.; one unit is already a big cell
-          n_structures: {mode: fixed, count: 60}
-
-        - formula: SmFe9Ti3    # everything unset -> defaults below
+            mode: fixed          # fixed | per_atom
+            count: 150           # spend more on the phase you care most about
+        - formula: Sm3Fe29Ti2    # not in the CSV; being tried for the first time
+          z: [1, 1]              # 34 atoms/f.u.; one unit is already a big cell
+          n_structures:
+            mode: fixed
+            count: 60
+        - formula: SmFe9Ti3      # everything unset -> defaults below
           z: [1, 2]
-
-        - {formula: Sm2Fe14Ti3, z: [1, 1]}    # flow style, same thing
-
-      # The bulk of the list, kept in a file so it can be generated, diffed and
-      # reviewed without touching the campaign. Path is relative to THIS file.
-      from_file: inputs/compositions.csv
-      # Columns: formula[,z_min,z_max,n_structures]; blank cells inherit;
-      # "#" comments and an optional header row are both fine.
+        - formula: Sm2Fe14Ti3
+          z: [1, 1]
+      from_file: inputs/compositions.csv   # formula[,z_min,z_max,n_structures]; relative to this file
 
     defaults:
-      z: {min: 1, max: 2}
-      max_atoms: 60           # higher than the sweep in example 1: a chosen
-                              # formula is worth a bigger cell than a formula
-                              # that merely fell out of an enumeration
-      n_structures: {mode: per_atom, structures_per_atom: 3.0}
-      n_structures_scope: per_z
+      z:
+        min: 1
+        max: 2
+      max_atoms: 60              # a chosen formula is worth a bigger cell than a swept one
+      n_structures:
+        mode: per_atom           # per_atom | fixed  (fixed takes `count: N` instead)
+        structures_per_atom: 3.0
+      n_structures_scope: per_z  # per_z | total
 
 # ---------------------------------------------------------------------------
-# GENERATE
+# GENERATE -- MatterGen, conditioned on each formula
 # ---------------------------------------------------------------------------
 generate:
-  engine: mattergen
+  engine: mattergen              # the only engine implemented
   mattergen:
     model: /projects/mmi/shuo/MatterGen_checkpoints/18-55-08
-    mode: csp                 # composition-conditioned, which is the whole
-                              # point of naming the formulas
-    max_batch_size: 100
-    timeout_per_batch: 1800
-  resources: {role: gpu, gpus: 1, time: "12:00:00"}
+    mode: csp                    # csp | unconditional  -- csp is the point of naming formulas
+    max_batch_size: 100          # structures per forward pass; lower it on GPU OOM
+    timeout_per_batch: 1800      # seconds
+  resources:
+    role: gpu                    # gpu | cpu | bigmem | short | short_gpu  (roles in machine.yaml)
+    gpus: 1
+    time: "12:00:00"
 
 # ---------------------------------------------------------------------------
 # SCREEN + DEDUP
 # ---------------------------------------------------------------------------
 screen:
-  mlip: mattersim
+  mlip: mattersim                # mattersim | chgnet
   mattersim:
     model: MatterSim-v1.0.0-5M.pth
-    fmax: 0.01
-    max_steps: 800            # more than the sweep's 500: a short list can
-                              # afford to converge its cells properly
-    batch_size: 32
+    fmax: 0.01                   # eV/A force convergence
+    max_steps: 800               # more than a sweep's 500: a short list can afford it
   dedup:
-    matcher: {ltol: 0.2, stol: 0.2, angle_tol: 5.0}
-    # A shortlist generates many structures per formula, so this stage removes
-    # more here than it does in a broad sweep. Loosen the tolerances to merge
-    # harder; tighten them to keep near-degenerate polymorphs apart.
-  resources: {role: gpu, gpus: 1, time: "12:00:00"}
+    matcher:                     # loosen to merge harder; tighten to keep polymorphs apart
+      ltol: 0.2
+      stol: 0.2
+      angle_tol: 5.0
+  resources:
+    role: gpu                    # gpu | cpu | bigmem | short | short_gpu
+    gpus: 1
+    time: "12:00:00"
 
 # ---------------------------------------------------------------------------
-# REFERENCE
+# REFERENCE -- the convex hull the candidates are measured against
 # ---------------------------------------------------------------------------
 reference:
-  functionals: [GGA]
-  thermo_type: GGA_GGA+U
-  energy_scale: raw
-  mode: recompute             # see D101 before trusting a DFT hull
-  prescreen_mode: mp_energies
-  prescreen_hull_max: 0.15
-  snapshot: true
-  relax_with_mlip: true
+  thermo_type: GGA_GGA+U         # GGA_GGA+U | R2SCAN | GGA_GGA+U_R2SCAN  -- PINNED
+  energy_scale: raw              # raw | mp_corrected
+  mode: recompute                # recompute | mp_energies  -- asked by `csp init`
+  energy_source: dft             # dft | mlip | mp  -- which store energy builds the FINAL hull
 
 # ---------------------------------------------------------------------------
-# CALIBRATE
-# ---------------------------------------------------------------------------
-calibrate:
-  mp:
-    on_fail: warn
-    thresholds: {mae_e_per_atom: 0.05, spearman_min: 0.90, max_volume_drift: 0.05}
-  pilot:
-    on_fail: block
-    pilot_n: 25               # fewer than the sweep's 40: the chemistry here
-                              # is narrow, so a smaller sample is representative
-    thresholds: {mae_e_per_atom: 0.05, mae_e_hull: 0.05, spearman_min: 0.90}
-
-# ---------------------------------------------------------------------------
-# FILTER
+# FILTER -- who is worth a VASP job
 # ---------------------------------------------------------------------------
 filter:
-  e_above_hull_max: 0.05      # tighter than the sweep's 0.10. You already
-                              # believe in these formulas; what you want now is
-                              # the right polymorph, not a broad net.
-  e_above_hull_max_source: calibrated
-  max_per_composition: 10     # higher than the sweep's 5, for the same reason:
-                              # here each composition IS the question
-  spacegroup: {min_number: 3} # drop P1/P-1 -- with this many structures per
-                              # formula, the symmetric ones are the interesting
+  e_above_hull_max: 0.05         # tighter than a sweep: you want the right polymorph now
+  max_per_composition: 10        # higher than a sweep: each composition IS the question
+  spacegroup:
+    min_number: 3                # 1 keeps everything; 3 drops P1 and P-1
 
 # ---------------------------------------------------------------------------
-# DFT
+# DFT -- the expensive half. INCAR tags and k-points are in recipe.yaml.
 # ---------------------------------------------------------------------------
 dft:
-  recipe: magnets
+  recipe: recipe.yaml            # this folder's copy | magnets | any path
+  layout: runs                   # runs | stages  (stages only for pre-2026-09-14 campaigns)
+  combined_job: true             # true | false  -- every step of a structure in one job
   potcar:
-    tree: VASP6.4
-    functional: PBE_64
-    overrides: {}             # e.g. {Sm: Sm_3, Ti: Ti_pv}
-  rare_earth: {f_treatment: frozen, magnetic_order: ferri, reconstruct_ms: true}
-  magnetism: {mode: ferrimagnetic_retm, strict: true}
-  ldau: {enabled: false, ldau_type: 2, u: {}, j: {}}
-  nbands: auto
-  incar_overrides: {}
-  max_in_flight: 120
-  max_concurrent_tasks: 32
+    tree: VASP6.4                # VASP6.4 | VASP5.2
+    functional: PBE_64           # the label matching the tree, e.g. PBE_54 for VASP5.2
+    overrides: {}                # several: {Sm: Sm_3, Ti: Ti_pv} -- element -> POTCAR symbol
+  rare_earth:
+    f_treatment: frozen          # frozen | valence  (valence needs ldau)
+    magnetic_order: ferri        # ferri | ferro | none
+    reconstruct_ms: true         # true | false  -- add the frozen 4f moment back when reporting
+  magnetism:
+    mode: ferrimagnetic_retm     # ferrimagnetic_retm | ferromagnetic | table | pymatgen | none
+    strict: true                 # true | false  -- fail rather than take a default MAGMOM
+  ldau:
+    enabled: false               # true | false
+    ldau_type: 2                 # 1 | 2 | 4
+    u: {}                        # several: {Sm: 6.0, Nd: 6.0} -- element -> U in eV
+    j: {}                        # several: {Sm: 0.0, Nd: 0.0} -- element -> J in eV
+  nbands: auto                   # auto, or an integer
+  incar_overrides: {}            # several: {NCORE: 8, LREAL: Auto} -- on top of every recipe step
+  max_in_flight: 120             # jobs queued at once
+  max_concurrent_tasks: 32       # array tasks running at once
+  max_cores: 2048                # cores queued + running for this campaign; null = no cap
   select:
-    rank_by: e_above_hull_mlip
-    max_per_composition: 5
-    max_total: 400            # a shortlist should not need 1,500 VASP runs
-    budget_core_hours: 60000
-
-# ---------------------------------------------------------------------------
-# ANALYZE
-# ---------------------------------------------------------------------------
-analyze:
-  properties: [m_dft_raw, m_s_reconstructed, volume, spacegroup]
-  report: html
+    rank_by: e_above_hull_mlip   # the order Phase B spends the budget in
+    max_total: 400               # LIFETIME ceiling; a shortlist should not need 1,500

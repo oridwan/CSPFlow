@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS job (
     attempt        INTEGER NOT NULL DEFAULT 0,
     workdir        TEXT    NOT NULL DEFAULT '',
     core_hours     REAL    NOT NULL DEFAULT 0.0,
+    cores          INTEGER NOT NULL DEFAULT 0,   -- ranks x cpus-per-task, as submitted
     exit_reason    TEXT    NOT NULL DEFAULT '',
     remedy         TEXT    NOT NULL DEFAULT '',   -- what the retry ladder tried
     provenance_id  INTEGER REFERENCES provenance(id),

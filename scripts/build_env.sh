@@ -18,6 +18,9 @@
 set -eo pipefail
 
 ENV_NAME="${1:-cspflow}"
+# The checkout this script lives in -- not a fixed path, so a group member
+# building their own env installs from whichever checkout they ran it from.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY=3.10
 TORCH=2.2.1
 CUDA=cu118
@@ -68,7 +71,7 @@ log "step 3b/5: pin setuptools<81 (mattersim still imports pkg_resources)"
 pip install --no-cache-dir "setuptools<81"
 
 log "step 4/5: cspflow itself"
-pip install --no-cache-dir -e /projects/mmi/Ridwan/cspflow
+pip install --no-cache-dir -e "$REPO"
 
 log "step 5/5: verification"
 python - <<'PY'
@@ -87,8 +90,13 @@ print("  (cuda unavailable on a login node is expected)")
 sys.exit(0 if ok else 1)
 PY
 
+# The lockfile belongs to the checkout. Someone building from a checkout they
+# cannot write to (another member's) gets theirs in $HOME instead of a failed
+# script at the very end of a successful build.
+LOCK="$REPO/scripts/env.lock.txt"
+[ -w "$REPO/scripts" ] || LOCK="$HOME/cspflow-env.lock.txt"
 log "writing lockfile"
-pip freeze > "/projects/mmi/Ridwan/cspflow/scripts/env.lock.txt"
-log "wrote scripts/env.lock.txt ($(wc -l < /projects/mmi/Ridwan/cspflow/scripts/env.lock.txt) packages)"
+pip freeze > "$LOCK"
+log "wrote $LOCK ($(wc -l < "$LOCK") packages)"
 
 log "done. activate with: conda activate $ENV_NAME"

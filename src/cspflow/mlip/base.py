@@ -51,6 +51,17 @@ class RelaxResult:
     error: str = ""
     engine: str = ""
 
+    # Per-site moments, when the engine predicts them. MatterSim does not and
+    # leaves these None -- that is the honest record, not a zero [D4].
+    #
+    # READ THIS BEFORE USING THEM. CHGNet predicts moment MAGNITUDES, |m|. It
+    # carries no sign, so `m_total` is the sum of magnitudes: the SATURATION
+    # value, assuming every site aligns. For a ferromagnet that is the moment.
+    # For a ferrimagnet it is an upper bound and can be badly high. Never
+    # report it as "the" moment, and never conclude an ordering from it [D3].
+    magmoms: list[float] | None = None
+    m_total: float | None = None
+
     @property
     def ok(self) -> bool:
         return not self.error and self.energy is not None
@@ -113,15 +124,24 @@ class BatchStats:
         return "\n".join(lines)
 
 
-def validate_structure(atoms) -> str:
+def validate_structure(atoms, *, max_lattice: float | None = None) -> str:
     """Reasons not to hand this cell to an MLIP.  Empty string means it is fine.
 
     Every one of these is cheap and every one of them is something a generative
     model actually produces. Checking first matters because an MLIP does not
     refuse a nonsense cell -- it returns an energy for it, and that energy then
     looks exactly like a real one on a hull.
+
+    `max_lattice` raises the length cap for callers whose structures are known
+    good.  The default 50 A exists to catch a generated cell with a 200 A axis;
+    applied to a Materials Project phase it also rejects real long-period
+    stacking polytypes.  Cu27Se20 (mp-684606) and Cu29Se19 (mp-685189) are
+    genuinely c = 65 A after Niggli reduction, and were silently dropped from
+    the MatterSim reference until this was separable.
     """
     import numpy as np
+
+    cap = MAX_LATTICE_A if max_lattice is None else max_lattice
 
     if len(atoms) == 0:
         return "rejected: empty cell"
@@ -129,9 +149,9 @@ def validate_structure(atoms) -> str:
     lengths = atoms.cell.lengths()
     if not np.all(np.isfinite(lengths)):
         return "rejected: non-finite lattice"
-    if any(a < MIN_LATTICE_A or a > MAX_LATTICE_A for a in lengths):
+    if any(a < MIN_LATTICE_A or a > cap for a in lengths):
         return (f"rejected: lattice parameter outside "
-                f"[{MIN_LATTICE_A}, {MAX_LATTICE_A}] A ({lengths.round(2).tolist()})")
+                f"[{MIN_LATTICE_A}, {cap}] A ({lengths.round(2).tolist()})")
 
     angles = atoms.cell.angles()
     if not np.all(np.isfinite(angles)):

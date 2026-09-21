@@ -423,7 +423,19 @@ class TestStructureList:
 
     def test_records_path_and_content_hash(self, seeds):
         s = expand_structure_list(sl([seeds / "good.vasp"])).structures[0]
-        assert s.path.endswith("good.vasp") and len(s.content_hash) == 16
+        assert s.path.endswith("good.vasp")
+        assert s.content_hash.startswith("sha256:")
+        assert len(s.content_hash) == len("sha256:") + 16
+
+    def test_content_hash_can_never_look_like_a_number(self, seeds):
+        """ASE refuses a string key_value_pair that int()/float() would parse, so a
+        bare hex digest breaks the source stage about once in 600 seeds -- measured:
+        23 of 14,777 on the RE-magnets campaign. The prefix rules it out by
+        construction."""
+        import re
+        number_like = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+        s = expand_structure_list(sl([seeds / "good.vasp"])).structures[0]
+        assert not number_like.match(s.content_hash)
 
     def test_a_directory_ignores_non_structure_files(self, seeds):
         """A README next to your seeds is not an error."""
@@ -464,6 +476,62 @@ class TestStructureList:
         )
         assert len(result.structures) == 1
         assert any("dropped" in w for w in result.warnings)
+
+    def test_dedup_off_skips_the_comparison_entirely(self, seeds):
+        """`StructureMatcher.fit` is ~320 ms on a small five-species cell and the
+        pairs grow as k-squared inside a formula group. 232 CePdGe seeds cost
+        237 s to compare against 6.8 s to parse and validate every file. When
+        the overlap is deliberate and recorded elsewhere, there is nothing to
+        learn from paying that."""
+        (seeds / "copy.vasp").write_text(GOOD_POSCAR)
+        result = expand_structure_list(
+            sl([seeds / "good.vasp", seeds / "copy.vasp"], dedup="off")
+        )
+        assert len(result.structures) == 2
+        assert not any("BOTH kept" in w or "dropped" in w for w in result.warnings)
+
+    def test_parallel_and_serial_comparison_agree(self, seeds, monkeypatch):
+        """The fits run in a process pool. They are pure and independent, so the
+        pool must not change a single verdict or the order they are reported in
+        -- the drop bookkeeping stays sequential precisely so it cannot."""
+        import cspflow.source.structure_list as mod
+
+        (seeds / "copy.vasp").write_text(GOOD_POSCAR)
+        (seeds / "copy2.vasp").write_text(GOOD_POSCAR)
+        paths = [seeds / "good.vasp", seeds / "copy.vasp", seeds / "copy2.vasp"]
+
+        monkeypatch.setattr(mod, "_PARALLEL_MIN_PAIRS", 0)        # force the pool
+        par = expand_structure_list(sl(paths, dedup="drop"))
+        monkeypatch.setattr(mod, "_PARALLEL_MIN_PAIRS", 10 ** 9)  # force serial
+        ser = expand_structure_list(sl(paths, dedup="drop"))
+
+        assert par.warnings == ser.warnings
+        assert [x.path for x in par.structures] == [x.path for x in ser.structures]
+
+    def test_a_structure_is_converted_once_not_once_per_pair(self, seeds, monkeypatch):
+        """The comparison used to convert BOTH sides of every pair, so a seed in
+        a group of 14 was converted 13 times over -- 1,478 conversions for 232
+        CePdGe seeds where 232 would do."""
+        import cspflow.source.structure_list as mod
+        from pymatgen.io.ase import AseAtomsAdaptor
+
+        paths = [seeds / "good.vasp"]
+        for n in range(4):
+            p = seeds / f"dup{n}.vasp"
+            # Same structure, different bytes, so the content-hash shortcut does
+            # not fire and every pair reaches StructureMatcher.
+            p.write_text(GOOD_POSCAR.replace("1.0", "1.000", 1))
+            paths.append(p)
+
+        calls = []
+        real = AseAtomsAdaptor.get_structure
+        monkeypatch.setattr(AseAtomsAdaptor, "get_structure",
+                            staticmethod(lambda a, **k: (calls.append(1), real(a, **k))[1]))
+        monkeypatch.setattr(mod, "_PARALLEL_MIN_PAIRS", 10 ** 9)
+        result = expand_structure_list(sl(paths))
+
+        # One conversion per structure that entered a comparison, never per pair.
+        assert calls and len(calls) <= len(result.structures)
 
     def test_relax_false_warns_about_the_geometry_it_will_report(self, seeds):
         result = expand_structure_list(sl([seeds / "good.vasp"], relax=False))

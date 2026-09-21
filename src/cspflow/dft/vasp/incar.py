@@ -26,8 +26,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from ...chem import RARE_EARTHS
 from ...config.schema import Ldau, Magnetism, RareEarth
 from ..recipe import KNOWN_TAGS, tag_value
+
+# The 5f series, for the same reason RARE_EARTHS exists: an element whose U
+# belongs on an f shell rather than a d shell.  Listed here rather than in
+# `chem` because nothing else in the codebase has needed it.
+ACTINIDES: frozenset[str] = frozenset(
+    "Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr".split()
+)
 
 # The RE-TM ferrimagnetic convention, ported VERBATIM from
 # `ter_mag_flow.py:MAGMOM_OVERRIDE` in /projects/mmi/shuo. Its own comment reads:
@@ -56,6 +64,69 @@ FERRI_RETM: dict[str, float] = {
     # late 3d: positive
     "Fe": 2.2, "Co": 2.0, "Ni": 2.0,
 }
+
+# The FERROMAGNETIC list, used for the reference build and every campaign that
+# consumes it.  Every element the reference set touches has an entry, because
+# `strict` refuses a default and 2,285 of 2,762 reference phases contain an
+# element the ferrimagnetic table never covered.
+#
+# ONE RULE, applied everywhere: the free-atom Hund's-rule maximum for the
+# valence d shell.  Not the expected converged moment.  Two reasons:
+#
+# *   It is an UPPER BOUND, so the SCF can only relax downward.  That is the
+#     reliable direction -- VASP descends from high spin to the right answer far
+#     more dependably than it climbs out of a low-spin or non-magnetic local
+#     minimum, and a trapped low-spin state does not announce itself.
+# *   It does not presuppose the result.  Seeding Fe at its known 2.2 muB bakes
+#     the answer into a calculation whose purpose is to find it, and would bias
+#     any phase where Fe is NOT 2.2.
+#
+# Elements with a filled or absent valence d shell get 0.6 -- pymatgen's own
+# fallback.  Not 0.0: a site seeded at exactly zero is slow to break symmetry,
+# and the light interstitials do carry small induced moments (N and C typically
+# -0.1 to -0.2 muB against the Fe sublattice).
+#
+# THE RARE EARTHS ARE 1.0, AND THAT IS THE `f_treatment: frozen` VALUE.  With
+# the `_3` datasets the 4f shell is in the CORE, and ZVAL accounts for exactly
+# what is left: Gd_3 has ZVAL 9 = 5s2 5p6 5d1, Sm_3 has ZVAL 11 = 5s2 5p6 5d1
+# 6s2.  One valence d electron, so the Hund maximum is 1 muB -- which is also
+# the right order for the induced 5d moment in an RE-TM magnet (0.3-0.5 muB).
+# The 4f moment is not in the calculation at all; `rare_earth.reconstruct_ms`
+# adds it back when reporting.
+#
+# A `f_treatment: valence` campaign must put the 4f magnitudes back, and gets a
+# different recipe_id for doing so.
+#
+# For reference, MP does none of this.  Its table is keyed by oxidation state
+# (Gd3+ 7, Sm3+ 5, ...), so on an UNDECORATED intermetallic none of those keys
+# fire and every rare earth falls to 0.6 -- while Ce and Eu, which have bare
+# entries, get 5 and 10.  Its transition metals are Fe 5, Ni 5, Mn 5, Cr 5, V 5,
+# Mo 5 and Co 0.6, the last being a long-standing pymatgen quirk rather than
+# physics.  And what MP actually RAN is neither: the stored INCARs carry
+# converged moments from a prior step (Gd +6.884 in GdCo2, +7.221 in GdNi2,
+# Sm -0.399 in SmFe2) while elemental Gd was seeded at 0.6.  See D109.
+FERRO_RETM: dict[str, float] = {
+    # --- 3d, by unpaired d count in the free atom ---
+    "Ti": 2.0,   # 3d2
+    "V":  3.0,   # 3d3
+    "Cr": 5.0,   # 3d5 (4s1)
+    "Mn": 5.0,   # 3d5
+    "Fe": 4.0,   # 3d6 -> four unpaired
+    "Co": 3.0,   # 3d7 -> three
+    "Ni": 2.0,   # 3d8 -> two
+    # --- 4d / 5d, same rule ---
+    "Zr": 2.0, "Nb": 4.0, "Mo": 5.0,
+    "Hf": 2.0, "Ta": 3.0, "W": 4.0, "Pt": 1.0,   # 5d9
+    # --- group 3 and the rare earths, 4f frozen: 5d1 is all that is left ---
+    "Sc": 1.0, "Y": 1.0, "La": 1.0, "Ce": 1.0, "Pr": 1.0, "Nd": 1.0,
+    "Pm": 1.0, "Sm": 1.0, "Eu": 1.0, "Gd": 1.0, "Tb": 1.0, "Dy": 1.0,
+    "Ho": 1.0, "Er": 1.0, "Tm": 1.0, "Yb": 1.0, "Lu": 1.0,
+    # --- filled or absent valence d: no local moment, seeded non-zero ---
+    "Cu": 0.6, "Zn": 0.6, "Ag": 0.6, "Pd": 0.6,
+    "Al": 0.6, "B": 0.6, "C": 0.6, "N": 0.6, "O": 0.6, "H": 0.6,
+    "Si": 0.6, "P": 0.6, "S": 0.6, "Ga": 0.6, "Ge": 0.6, "Sn": 0.6,
+}
+
 
 # What an element not in the table gets when `strict` is off. 0.6 is pymatgen's
 # own fallback and the legacy script's.
@@ -106,7 +177,10 @@ def magmom_for(
 
 
 def _table_for(magnetism: Magnetism, rare_earth: RareEarth | None) -> dict[str, float]:
-    if magnetism.mode == "table":
+    if magnetism.mode in ("table", "ferromagnetic"):
+        # `ferromagnetic` arrives already materialised by the schema validator,
+        # so there is no branch here that could disagree with what recipe_id
+        # hashed.  That is the point of materialising it there rather than here.
         return dict(magnetism.table)
     if magnetism.mode == "ferrimagnetic_retm":
         table = dict(FERRI_RETM)
@@ -176,12 +250,32 @@ def lmaxmix_for(f_in_valence: bool) -> int:
     return 6 if f_in_valence else 4
 
 
+def ldaul_for(element: str) -> int:
+    """Which orbital quantum number U acts on: 3 for an f shell, 2 for a d shell.
+
+    This used to be hardcoded to 2, which is right for a transition metal and
+    silently WRONG for a rare earth: it puts U on the RE 5d shell while the 4f
+    it was meant for stays uncorrected.  A campaign that turned U on for Nd to
+    localise its 4f would have got a correction on the wrong shell and no error
+    message, because VASP accepts LDAUL=2 for Nd perfectly happily.
+
+    Inferred from the element rather than configured, deliberately.  A new field
+    on the `Ldau` model would land in `model_dump()`, which `recipe_id` hashes --
+    every existing campaign's id would move and the computed store would stop
+    matching.  A pure function of the element changes no hash at all.
+    """
+    return 3 if element in RARE_EARTHS or element in ACTINIDES else 2
+
+
 def ldau_block(ldau: Ldau, elements: Sequence[str]) -> dict[str, Any]:
     """The LDAU tags, in POSCAR element order.
 
     Note the coupling the plan flags: turning U on changes which MP entries are a
     valid reference set, because MP's own GGA and GGA+U entries do not share an
     energy zero on the raw scale.
+
+    `LDAUL` is -1 for any element given U = 0, which is how VASP is told to leave
+    that species alone; the others get the shell `ldaul_for` picks.
     """
     if not ldau.enabled:
         return {}
@@ -195,7 +289,7 @@ def ldau_block(ldau: Ldau, elements: Sequence[str]) -> dict[str, Any]:
     return {
         "LDAU": ".TRUE.",
         "LDAUTYPE": ldau.ldau_type,
-        "LDAUL": [2 if ldau.u.get(e, 0.0) else -1 for e in elements],
+        "LDAUL": [ldaul_for(e) if ldau.u.get(e, 0.0) else -1 for e in elements],
         "LDAUU": [float(ldau.u.get(e, 0.0)) for e in elements],
         "LDAUJ": [float(ldau.j.get(e, 0.0)) for e in elements],
         "LDAUPRINT": 1,

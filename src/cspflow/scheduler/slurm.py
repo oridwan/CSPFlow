@@ -24,6 +24,8 @@ actually behaves, which is where the sharp edges are:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import os
 import re
 import shlex
@@ -176,11 +178,72 @@ class SlurmScheduler:
         # unset variable and aborts the whole job under `set -u`.  See D026.
         lines.append("set -eo pipefail")
         lines.append("")
+        # VASP compiled with Intel Fortran puts large automatic arrays on the
+        # STACK, and this site's soft limit is 8 MB against an unlimited hard
+        # limit -- so raising it needs no privilege and is what every VASP
+        # install guide asks for.  Without it the run dies as
+        #     forrtl: severe (174): SIGSEGV, segmentation fault occurred
+        # inside EDDAV, which names neither the stack nor the limit.
+        #
+        # Measured on t3 2026-09-02: 9 of 9 genuine failures in array 26811406
+        # crashed this way, 7 of them at exactly `DAV: 5`, on 9 different nodes
+        # across Orion, Apus and Nebula -- with MaxRSS 200-360 MB against the
+        # 180 G requested.  That gap is the tell: it is not memory exhaustion,
+        # so asking for more `--mem` would have fixed nothing.  ISPIN=2 doubles
+        # the wavefunction arrays and brings the overflow forward, which is why
+        # the large non-magnetic cells (C240, Si232) hit it first.  See D115.
+        lines.append("ulimit -s unlimited || true")
+        lines.append("")
+        # Submitting from INSIDE a SLURM allocation -- an Open OnDemand shell, an
+        # salloc, a job that launches other jobs -- leaks that allocation's
+        # SLURM_* variables through sbatch into this script, and from here into
+        # srun.  Two of them are actively harmful and neither announces itself:
+        #
+        #   SLURM_EXPORT_ENV=NONE      srun hands the task an EMPTY environment.
+        #                              No PATH ("execve(): bash: No such file or
+        #                              directory"), no LD_LIBRARY_PATH (VASP dies
+        #                              with "error while loading shared
+        #                              libraries: libmkl_intel_lp64.so.2").
+        #   SLURM_NTASKS_PER_NODE      a task shape from the OTHER job, which
+        #   SLURM_TASKS_PER_NODE       contradicts this job's own #SBATCH lines
+        #                              and breaks MPI init.
+        #
+        # SLURM sets neither of those for a batch job that did not ask for them,
+        # so clearing them here restores the default rather than overriding
+        # anything this script chose.  Measured on Orion 2026-09-01: without
+        # this, 545 of 545 DFT jobs failed in the first seconds on every node of
+        # three partitions.
+        lines.append("# inherited from the submitting allocation; see D111")
+        lines.append("export SLURM_EXPORT_ENV=ALL")
+        # NARROW on purpose.  SLURM sets SLURM_NTASKS and SLURM_TASKS_PER_NODE
+        # correctly for this batch job from its own #SBATCH --ntasks, and
+        # clearing those makes srun fall back to a SINGLE rank -- a 16-core job
+        # that quietly runs on one core and still converges.  Measured: the wide
+        # version printed "running 1 mpi-ranks" for an --ntasks=16 job.
+        #
+        # SLURM_NTASKS_PER_NODE is different: it is set only when
+        # --ntasks-per-node is requested, which this generator never does, so any
+        # value present has leaked in and contradicts the job's own shape.
+        lines.append("unset SLURM_NTASKS_PER_NODE")
+        lines.append("")
 
         for module in (spec.modules or m.modules.get(spec.role, [])):
             lines.append(f"module load {module}")
         for key, value in {**m.env, **spec.env}.items():
-            lines.append(f"export {key}={shlex.quote(str(value))}")
+            text = str(value)
+            if "$" in text:
+                # A PATH-shaped variable has to be able to name the one it is
+                # extending -- LD_LIBRARY_PATH is set by prepending, not by
+                # replacing, and clobbering it breaks the conda python that runs
+                # two lines further down.  shlex.quote would emit single quotes
+                # and the reference would land in the environment literally.
+                #
+                # Double quotes still protect spaces and globs; what they let
+                # through is exactly the expansion that was asked for by writing
+                # a `$` in a config file.
+                lines.append(f'export {key}="{text}"')
+            else:
+                lines.append(f"export {key}={shlex.quote(text)}")
         env_name = spec.conda_env or m.conda.get(spec.role, "")
         if env_name:
             lines.append('eval "$(conda shell.bash hook)"')
@@ -252,13 +315,7 @@ class SlurmScheduler:
         statuses: dict[str, JobStatus] = {
             jid: JobStatus(job_id=jid, state=JobState.unknown) for jid in job_ids
         }
-        observed: dict[str, JobStatus] = {}
-        observed.update(self._squeue(job_ids))
-        for jid, status in self._sacct(job_ids).items():
-            if jid not in observed or observed[jid].state is JobState.unknown:
-                observed[jid] = status
-            elif not observed[jid].state.terminal and status.state.terminal:
-                observed[jid] = status
+        observed = self._observe(job_ids)
 
         # Answer for exactly the ids that were asked about.
         #
@@ -280,6 +337,37 @@ class SlurmScheduler:
             if tasks:
                 statuses[jid] = aggregate_array(jid, tasks)
         return statuses
+
+    def _observe(self, job_ids: list[str]) -> dict[str, JobStatus]:
+        """Every id the scheduler will talk about, base ids and array tasks alike.
+
+        `squeue` is authoritative for what is still live and `sacct` for what
+        has ended, so a terminal answer from `sacct` overrides a stale live one
+        but never the other way round.
+        """
+        observed: dict[str, JobStatus] = {}
+        observed.update(self._squeue(job_ids))
+        for jid, status in self._sacct(job_ids).items():
+            if jid not in observed or observed[jid].state is JobState.unknown:
+                observed[jid] = status
+            elif not observed[jid].state.terminal and status.state.terminal:
+                observed[jid] = status
+        return observed
+
+    def poll_tasks(self, job_ids: list[str]) -> dict[str, JobStatus]:
+        """Per-task statuses, keyed `<base>_<task>` as SLURM reports them.
+
+        `poll` deliberately collapses an array to one status, because a stage
+        handed a half-finished array would mark unfinished work done.  But that
+        also means a 200-task array holds 200 in-flight slots until its slowest
+        task ends, so capacity is released in one lump at the end and the queue
+        drains to nothing while work waits (D113).  Reconciling per task frees
+        each slot as its own task finishes; the caller is responsible for
+        handing back only that task's claim.
+        """
+        if not job_ids:
+            return {}
+        return self._observe(job_ids)
 
     @staticmethod
     def _aggregate(job_id: str, tasks: list[JobStatus]) -> JobStatus:  # pragma: no cover
@@ -324,7 +412,57 @@ class SlurmScheduler:
                 signal=signal, reason=reason, elapsed_seconds=parse_elapsed(elapsed),
                 alloc_cpus=int(cpus) if cpus.isdigit() else 0, raw_state=raw,
             )
+        self._promote_step_causes(out)
         return out
+
+    # Step states that say something the allocation row does not.  Only causes
+    # that map to a retry rung are worth a second query.
+    _STEP_CAUSES = ("OUT_OF_MEMORY",)
+
+    def _promote_step_causes(self, out: dict[str, JobStatus]) -> None:
+        """Recover the real cause of death from a job's STEPS.
+
+        `-X` above asks for allocation rows only, so that `.batch` and `.extern`
+        do not masquerade as the job.  The cost is that it also hides the step
+        that actually died, and SLURM reports the cause THERE, not on the
+        allocation:
+
+            26930826_0         dft-18-static   FAILED          1:0
+            26930826_0.batch   batch           FAILED          1:0
+            26930826_0.0       vasp_std        OUT_OF_MEMORY   0:125
+
+        The driver matched retry rules against the allocation's raw state, saw
+        `FAILED`, and never fired the `out_of_memory` rung the magnets recipe has
+        carried all along. Three CeFeB statics dead-ended that way on 2026-09-12
+        -- sids 18, 50 and 52, all killed after five seconds on three different
+        nodes, all with a `resources: {mem: 64G}` remedy sitting unused.
+
+        One extra call, and only when something has already failed.
+        """
+        failed = [jid for jid, st in out.items()
+                  if st.state is JobState.failed and
+                  not st.raw_state.startswith(self._STEP_CAUSES)]
+        if not failed:
+            return
+
+        result = self._run(
+            ["sacct", "-n", "-P", "-o", "JobID,State",
+             "--jobs", ",".join(failed)],
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) < 2:
+                continue
+            step_id, raw = parts[0].strip(), parts[1].strip()
+            if "." not in step_id or not raw.startswith(self._STEP_CAUSES):
+                continue
+            parent = step_id.rsplit(".", 1)[0]
+            status = out.get(parent)
+            if status is not None:
+                # The state stays `failed`; only the REASON is corrected, which
+                # is what `_rule_for` matches on.
+                out[parent] = replace(status, raw_state=raw)
 
     def cancel(self, job_ids: list[str]) -> None:
         if job_ids and not self.dry_run:

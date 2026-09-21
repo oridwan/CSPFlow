@@ -1,0 +1,115 @@
+# The SHIPPED `magnets` recipe, with two numbers changed and nothing else.
+#
+# WHY IT IS COPIED RATHER THAN NAMED
+#     A test wants small, fast jobs. It does NOT want energies on a different
+#     scale from the reference hull -- that is D101, and a hull built from two
+#     scales looks correct and ranks wrongly.
+#
+#     `recipe_id` hashes the recipe's `name:` and its PHYSICS (INCAR tags,
+#     k-point density). It does NOT hash `ntasks` or `time`. So changing only
+#     the allocation makes the jobs cheaper to schedule while leaving the
+#     energies bit-for-bit comparable with the reference store.
+#
+#     TWO CONSEQUENCES, BOTH IMPORTANT:
+#       * do NOT change `name:` -- renaming a copy invents a scale mismatch
+#         that is not real;
+#       * do NOT touch ENCUT, the k-point density, or any INCAR tag. Every one
+#         of those DOES change the hash, and then the hull is mixed.
+#
+# WHAT CHANGED
+#     relax  : ntasks 64 -> 16, time 24:00:00 -> 04:00:00
+#     static : ntasks 64 -> 16, time 12:00:00 -> 02:00:00
+#
+#     16 ranks because these cells are 6-10 atoms: 64 ranks would be mostly
+#     communication, and a 16-rank job also starts sooner. NCORE stays 8 and
+#     8 divides 16, so the parallel plan is still valid.
+#
+# RE-TM magnet recipe: relax, then a tetrahedron static for the final energy.
+#
+# Every INCAR tag is written out. There is no `MPRelaxSet` and no other implicit
+# base set, because a base set is pymatgen version state rather than campaign
+# state -- an upgrade would move ENCUT or the LDAU tables mid-campaign and
+# provenance recording "base_set: MPRelaxSet" would reproduce nothing.
+#
+# `incar:` is free-form. Add any tag you like; unknown ones are written as given
+# and warned about, never dropped.
+#
+# The values below are the current working set for this project. The ones you
+# are most likely to want to change are ENCUT, NSW, EDIFFG and NCORE.
+name: magnets
+
+stages:
+  - name: relax
+    incar:
+      # --- electronic ---
+      PREC:    Accurate
+      ENCUT:   520          # eV. EXPLICIT and composition-independent: VASP's
+                            # own default is max(ENMAX) over the POTCARs, which
+                            # is 267.9 eV for Sm_3/Fe/Ti and 295.4 eV with Cu.
+                            # A hull built on that compares incomparable numbers.
+      ALGO:    Fast
+      EDIFF:   1.0e-4
+      NELM:    200          # VASP defaults to 60: the SCF gives up early and
+                            # the job still exits successfully.
+      NELMIN:  6
+      LREAL:   .FALSE.
+      ISYM:    2
+      SYMPREC: 1.0e-5
+      LASPH:   .TRUE.       # aspherical corrections; matters for 4f
+      # LMAXMIX is computed from the POTCARs (6 with f in valence, 4 for d-only)
+      # unless set here explicitly.
+
+      # --- ionic ---
+      IBRION:  1
+      ISIF:    3
+      NSW:     99
+      EDIFFG:  -0.01
+      POTIM:   0.3
+
+      # --- smearing (metals) ---
+      ISMEAR:  1
+      SIGMA:   0.05
+
+      # --- spin ---
+      ISPIN:   2            # VASP defaults to 1; every moment would be zero.
+      # MAGMOM is computed per structure from dft.magnetism.
+
+      # --- output / parallel ---
+      LORBIT:  11           # site-projected moments; Stage 7 needs them.
+      LWAVE:   .FALSE.
+      LCHARG:  .FALSE.
+      NCORE:   8
+    kpoints:   {scheme: reciprocal_density, value: 64}
+    resources: {role: cpu, ntasks: 16, time: "04:00:00"}   # 64->16 ranks: these cells are 6-10 atoms
+    retry:
+      - when: timeout
+        remedy: resume_from_contcar
+      - when: scf_not_converged
+        set: {ALGO: Normal, NELM: 300}
+      - when: ionic_step_limit
+        set: {NSW: 200}
+        remedy: resume_from_contcar
+      - when: out_of_memory
+        # `--mem` is estimated per structure now, but an estimate can miss. This
+        # is the rung that catches the miss instead of failing the structure.
+        resources: {mem: 64G}
+
+  - name: static
+    inherit: relax          # copies every tag above, then overrides
+    incar:
+      IBRION:  -1
+      NSW:     0
+      ISMEAR:  -5           # tetrahedron for the final energy and DOS
+      EDIFF:   1.0e-6
+      LCHARG:  .TRUE.
+    resources: {role: cpu, ntasks: 16, time: "02:00:00"}   # ntasks and time are NOT in recipe_id
+    # The static stage had no retry ladder at all, so ANY failure here was
+    # terminal -- including the three CeFeB statics killed by the OOM that
+    # `--mem` estimation now prevents. A stage that can fail needs rungs.
+    retry:
+      - when: out_of_memory
+        resources: {mem: 64G}
+      - when: timeout
+        resources: {time: "24:00:00"}
+      - when: scf_not_converged
+        set: {ALGO: Normal, NELM: 300}
