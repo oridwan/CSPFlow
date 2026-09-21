@@ -18,6 +18,8 @@ expensive DFT runs as a throttled stream under a core cap (`dft.max_cores`).
 
 **📖 [User guide](docs/) · [Quick start](docs/02-quickstart.md) · [Examples](examples/)**
 
+![cspflow — cheatsheet tutorial overview for full workflow](docs/assets/cspflow-full-workflow-tutorial-3x.png)
+
 ## Install
 
 ```bash
