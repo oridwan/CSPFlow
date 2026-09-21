@@ -39,13 +39,20 @@ from typing import Iterator
 
 from ..chem import RARE_EARTHS, canonical_formula, n_rare_earth
 from ..config.schema import ChemicalSpace, Source
-from .base import EmittedComposition, RejectionLog, SourceResult, expand_z
+from .base import EmittedComposition, RejectionLog, SourceError, SourceResult, expand_z
 
 
 def expand_chemical_space(source: Source) -> SourceResult:
     space = source.chemical_space
     if space is None:                                   # pragma: no cover - schema guards
         raise ValueError("expand_chemical_space called on a source without a block")
+
+    empty = [name for name, g in space.groups.items() if not g.elements]
+    if empty:
+        raise SourceError(
+            f"source '{source.name}': chemical_space group(s) {', '.join(empty)} have no "
+            f"elements yet. Fill in `elements:` for each group in campaign.yaml, "
+            f"e.g. elements: [Sm, Nd, Pr]")
 
     result = SourceResult(name=source.name, mode=source.mode.value)
     reject = result.rejected

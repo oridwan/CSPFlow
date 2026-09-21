@@ -53,15 +53,19 @@ csp init 3 my-seeds -m local --no-recompute-reference
 | `--force` | | overwrite existing files |
 | `--recompute-reference / --no-recompute-reference` | ask | the one reference question; written as `reference.mode` |
 
-**What is in `campaign.yaml`.** The example file for the type, with four lines
-changed: `name`, `machine`, `dft.recipe` and `reference.mode`. Every setting
+**What is in `campaign.yaml`.** The example file for the type with `name`,
+`machine`, `dft.recipe` and `reference.mode` set, and **its chemistry removed**:
+type 1's groups get `elements: []`, type 2's inline `items:` become `[]`. Every setting
 that matters is live, written out even where it equals the default, and its
 alternatives are in a comment on the same line — `# a | b | c` means pick one;
 `# several: ...` means a comma-separated list or several `key: value` pairs.
 
-**Inputs.** Types 2 and 3 also get the example's demo inputs —
-`inputs/compositions.csv`, or five Sm-Fe seeds in `inputs/seeds/` — so
-`csp source --dry-run` works straight away. Replace them with your own.
+**Inputs start empty** — no example data is copied, so nothing runs on the
+example's Sm-Fe chemistry by accident. Type 2 gets a header-only
+`inputs/compositions.csv`, type 3 an empty `inputs/seeds/`. The campaign still
+loads, so `csp doctor` works at once; `csp source --dry-run` stops and names what
+is missing until you fill it in (D153). The worked inputs stay in `examples/`
+if you want to copy them deliberately.
 
 **No type given.** `csp init my-campaign` (the older form) prints the three
 types and asks on a terminal. With no terminal — a script, CI — it stops with
@@ -89,8 +93,9 @@ It also checks **`reference recipe`**: whether this campaign's DFT policy hashes
 to the same `recipe_id` as the shared reference store. A mismatch is a warning,
 not a failure, because the campaign still runs — it just reads an *empty*
 reference set, so every system is refused for incomplete coverage and no
-`dft_e_above_hull` is written. The shipped template does not match a
-`ferromagnetic` store out of the box. See [the reference set](10-reference-set.md).
+`dft_e_above_hull` is written. A campaign from `csp init` matches the shared
+store out of the box (D154); editing any `dft:` field can break that, and this
+check says so. See [the reference set](10-reference-set.md).
 
 ## `csp source`
 

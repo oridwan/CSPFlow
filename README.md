@@ -1,7 +1,5 @@
 ![cspflow — thousands of generated candidate crystals funnelled down to the few that sit lowest on the energy landscape](docs/assets/cspflow-cover-v3.png)
 
-# cspflow
-
 End-to-end high-throughput crystal structure prediction and first-principles
 discovery. Give it a chemical space, a list of compositions, or a folder of
 structures; it generates candidates, screens them with an MLIP, places them on a
@@ -55,7 +53,7 @@ my-campaign/
 ├── campaign.yaml   what to search, and how hard   ← every setting live, alternatives beside it
 ├── machine.yaml    partitions, walltime, modules, VASP, POTCAR trees
 ├── recipe.yaml     the DFT ladder: INCAR tags, k-points, per-step resources
-├── inputs/         your own structures or composition lists (types 2, 3: demo copies)
+├── inputs/         your own structures or composition lists (starts empty)
 ├── results/        everything the campaign produces
 └── report/         report.html + candidates.csv
 ```

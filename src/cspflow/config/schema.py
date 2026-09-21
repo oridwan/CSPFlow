@@ -115,7 +115,11 @@ class ElementGroup(Base):
     sec.0.1.
     """
 
-    elements: list[str] = Field(..., min_length=1)
+    # Empty is allowed, and means "not filled in yet": `csp init 1` writes
+    # `elements: []` so a new campaign carries no example chemistry, and the
+    # campaign still loads for `csp doctor`. `csp source` refuses it with the
+    # group named (D153).
+    elements: list[str] = Field(...)
     pick: int | list[int] = Field(
         ..., description="how many elements to take from this group; int or list of arities"
     )
@@ -152,7 +156,7 @@ class ElementGroup(Base):
                 f"min_fraction ({self.min_fraction}) > max_fraction ({self.max_fraction})"
             )
         for a in self.arities():
-            if a > len(self.elements):
+            if self.elements and a > len(self.elements):
                 raise ValueError(
                     f"pick={a} exceeds the {len(self.elements)} elements in the group"
                 )

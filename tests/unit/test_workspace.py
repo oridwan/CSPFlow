@@ -66,13 +66,39 @@ def test_existing_files_are_not_clobbered(tmp_path):
 
 # --- the three types ------------------------------------------------------
 
-def test_type_2_and_3_bring_the_example_inputs(tmp_path):
-    """A scaffold whose `from_file` / `paths` point at nothing cannot dry-run."""
+def test_a_new_campaign_carries_no_example_chemistry(tmp_path):
+    """D153: a new user must not run the example's Sm-Fe chemistry by accident.
+    No demo inputs are copied, and the yaml's elements / formulas are blank."""
+    one = yaml.safe_load(campaign_yaml("1", name="demo"))
+    groups = one["source"][0]["chemical_space"]["groups"]
+    assert groups and all(g["elements"] == [] for g in groups.values())
+
     two = _init(tmp_path / "a", kind="2")
-    assert (two / "inputs" / "compositions.csv").read_bytes() == (
-        EXAMPLES_DIR / "2-composition-list" / "inputs" / "compositions.csv").read_bytes()
+    assert yaml.safe_load((two / "campaign.yaml").read_text())[
+        "source"][0]["composition_list"]["items"] == []
+    csv = (two / "inputs" / "compositions.csv").read_text()
+    data = [l for l in csv.splitlines() if l.strip() and not l.startswith("#")]
+    assert data == ["formula,z_min,z_max,n_structures"], "header only, no formulas"
+
     three = _init(tmp_path / "b", kind="3")
-    assert len(list((three / "inputs" / "seeds").glob("*.vasp"))) == 5
+    assert (three / "inputs" / "seeds").is_dir()
+    assert list((three / "inputs" / "seeds").iterdir()) == []
+
+
+@pytest.mark.parametrize("kind,says", [
+    ("1", "have no elements yet"),
+    ("2", "produced no items"),
+    ("3", "matched no files"),
+])
+def test_an_unfilled_campaign_loads_but_refuses_at_source(tmp_path, kind, says):
+    """It must LOAD, so `csp doctor` can check the cluster before the chemistry
+    is filled in -- and then `csp source` must say what is missing."""
+    from cspflow.source import SourceError, expand_all
+
+    root = _init(tmp_path, kind=kind)
+    cfg = load_campaign(root / "campaign.yaml")
+    with pytest.raises(SourceError, match=says):
+        expand_all(cfg.campaign, cfg.base_dir)
 
 
 @pytest.mark.parametrize("kind,mode", [("1", "chemical_space"), ("2", "composition_list"),
@@ -86,11 +112,13 @@ def test_each_type_scaffolds_its_own_source_mode(tmp_path, kind, mode):
 
 
 def test_init_is_the_example_with_only_four_lines_changed(tmp_path):
-    """The example IS the template. Anything but name, machine, recipe and the
-    reference answer differing means the two have started to drift."""
+    """The example IS the template. Apart from its chemistry (blanked, tested
+    above), anything but name, machine, recipe and the reference answer
+    differing means the two have started to drift."""
     for kind, folder in [("1", "1-chemical-space"), ("2", "2-composition-list"),
                          ("3", "3-structure-list")]:
-        made = yaml.safe_load(campaign_yaml(kind, name="demo", reference_mode="mp_energies"))
+        made = yaml.safe_load(campaign_yaml(kind, name="demo", reference_mode="mp_energies",
+                                            keep_example_chemistry=True))
         example = yaml.safe_load((EXAMPLES_DIR / folder / "campaign.yaml").read_text())
         assert made.pop("name") == "demo"
         example.pop("name")

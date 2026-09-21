@@ -151,3 +151,25 @@ def test_every_listed_alternative_is_accepted_by_the_schema(name):
             except ValidationError as exc:
                 own = [e for e in exc.errors() if e["loc"] and e["loc"][-1] == m.group("key")]
                 assert not own, f"{name}: {m.group('key')}: {alt} is listed but rejected: {own}"
+
+
+@pytest.mark.parametrize("name", EXAMPLE_NAMES)
+def test_example_dft_policy_matches_the_shared_store(name):
+    """D154: every `csp init` campaign must land on the reference store's energy
+    scale. The examples were `ferri` while the store (and every production
+    campaign) is `ferro`, so a new campaign's hull was silently on another scale.
+
+    Needs the cluster's shared store; skipped anywhere it is not mounted."""
+    from cspflow.cli import _dft_and_recipe
+    from cspflow.dft.recipe import load_recipe
+    from cspflow.reference.computed import recipe_id
+    from cspflow.reference.refstore import store_root
+
+    settings = store_root() / "settings.yaml"
+    if not settings.is_file():
+        pytest.skip(f"no reference store settings at {settings}")
+    cfg, _ = _load(name)
+    mine = recipe_id(cfg.campaign.dft, load_recipe(cfg.campaign.dft.recipe, cfg.base_dir))
+    s_dft, s_recipe, _ = _dft_and_recipe(settings, None)
+    assert mine == recipe_id(s_dft, s_recipe), \
+        f"{name}: DFT policy differs from {settings}; copy the store's dft: block"

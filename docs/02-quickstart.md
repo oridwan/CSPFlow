@@ -50,7 +50,7 @@ my-campaign/
 ├── campaign.yaml   what to search, and how hard   ← every setting live, alternatives beside it
 ├── machine.yaml    partitions, walltime, modules, VASP, POTCAR trees
 ├── recipe.yaml     the DFT ladder: INCAR tags, k-points, per-step resources
-├── inputs/         your own structures or composition lists (types 2, 3: demo copies)
+├── inputs/         your own structures or composition lists (starts empty)
 ├── results/        everything the campaign produces
 └── report/         report.html + candidates.csv
 ```
@@ -68,7 +68,7 @@ in it. **Every line that is not a comment is a live setting**, written out even
 where it equals the default. Beside each one, a comment lists what else it can be:
 
 ```yaml
-magnetic_order: ferri        # ferri | ferro | none                 <- pick ONE
+magnetic_order: ferro        # ferro | ferri | none                 <- pick ONE
 elements: [Sm, Tb]           # several: [Sm, Nd, Pr, ...]           <- a comma-separated list
 overrides: {}                # several: {Sm: Sm_3, Ti: Ti_pv}       <- several key: value pairs
 ```

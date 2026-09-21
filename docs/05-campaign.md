@@ -211,10 +211,11 @@ reference:
 >
 > **The catch is `recipe_id`.** The store is keyed on your DFT policy, so a
 > campaign whose policy differs by one field reads an *empty* reference set and
-> every system is refused. The shipped template defaults to
-> `magnetism.mode: ferrimagnetic_retm`; if the store was built `ferromagnetic`,
-> a fresh campaign does **not** match. `csp doctor` now checks this explicitly —
-> see [the reference set](10-reference-set.md).
+> every system is refused. `csp init` writes the shared store's own magnetic
+> policy (`magnetic_order: ferro`, `magnetism.mode: ferromagnetic` plus its table),
+> so a fresh campaign matches out of the box (D154). Change any DFT field and it
+> no longer does — `csp doctor` checks this explicitly; see
+> [the reference set](10-reference-set.md).
 >
 > Phase A gates on the MLIP hull and is unaffected.
 
@@ -269,8 +270,8 @@ depends on the campaign rather than on the ladder.
 dft:
   recipe: recipe.yaml
   potcar: {tree: VASP6.4, functional: PBE_64, overrides: {}}
-  rare_earth: {f_treatment: frozen, magnetic_order: ferri, reconstruct_ms: true}
-  magnetism: {mode: ferrimagnetic_retm, strict: true}
+  rare_earth: {f_treatment: frozen, magnetic_order: ferro, reconstruct_ms: true}
+  magnetism: {mode: ferromagnetic, strict: true}   # + the store's table; see the examples
   ldau: {enabled: false, ldau_type: 2, u: {}, j: {}}
   nbands: auto
   incar_overrides: {}

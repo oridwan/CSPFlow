@@ -228,8 +228,7 @@ MLIP screening. This is what the production CePdGe and CeFeB campaigns use.
 
 ```bash
 csp init 3 my-seeds -m orion && cd my-seeds
-rm inputs/seeds/*.vasp               # the five demo Sm-Fe seeds from the example
-cp /somewhere/*.vasp inputs/seeds/
+cp /somewhere/*.vasp inputs/seeds/   # inputs/seeds/ starts empty; subfolders are searched too
 ```
 
 Accepted: POSCAR/`.vasp`, CIF. A folder is walked; globs work too.

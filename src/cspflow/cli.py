@@ -177,10 +177,11 @@ def init(
       2     composition_list   I know which formulas I want
       3     structure_list     I already have the structures
 
-    Example: csp init 1 my-sweep. The folder gets campaign.yaml (the example for that type, every live
-    setting written out with its alternatives beside it), editable copies of
-    machine.yaml and recipe.yaml, and for types 2 and 3 the example's demo
-    inputs, to be replaced with your own. TYPE also accepts the mode name.
+    Example: csp init 1 my-sweep. The folder gets campaign.yaml (every setting
+    of the example for that type, with its alternatives beside it, but none of
+    its chemistry), editable copies of machine.yaml and recipe.yaml, and an
+    empty inputs/. Fill in your elements, formulas or structures; `csp source`
+    says what is still missing. TYPE also accepts the mode name.
     """
     from .dft.recipe import RECIPE_DIR
 
@@ -188,9 +189,10 @@ def init(
     ref_mode = _ask_reference_mode(recompute_reference)
 
     try:
-        demo_inputs = templates.example_inputs(ctype)
+        templates.example_dir(ctype)
     except FileNotFoundError as exc:
         _die(str(exc))
+    starters = templates.starter_inputs(ctype)
 
     if out is not None:                     # single-file mode
         if out.exists() and not force:
@@ -200,9 +202,9 @@ def init(
                                                recipe=recipe, minimal=minimal,
                                                reference_mode=ref_mode))
         typer.echo(f"wrote {out}  ({ctype.label})")
-        if demo_inputs:
-            typer.echo(f"It reads {demo_inputs[0][0].split('/')[0]}/... beside itself; "
-                       f"see examples/{ctype.folder}/inputs for the format.")
+        if ctype.number in (2, 3):
+            typer.echo(f"It reads inputs/ beside itself; see examples/{ctype.folder}/inputs "
+                       f"for the format.")
         typer.echo("Next: edit it, then run `csp doctor`.")
         return
 
@@ -240,24 +242,18 @@ def init(
         _write("recipe.yaml", templates.recipe_copy(recipe_src, name=name))
         _write("README.md", templates.workspace_readme(ctype, name=name))
         _write("inputs/README.md", templates.inputs_readme(ctype))
-    for rel, src in demo_inputs:
-        _write(rel, src.read_bytes())
+    for rel, text in starters.items():
+        _write(rel, text)
+    if ctype.number == 3:
+        (root / "inputs" / "seeds").mkdir(parents=True, exist_ok=True)
 
     typer.secho(f"\ncampaign {name} ({ctype.label}) in {root}/", fg=typer.colors.GREEN, bold=True)
     typer.echo(f"  \"{ctype.question}\" -- you give {ctype.what_you_give}\n")
-    shown: set[str] = set()
     for path in written:
         rel = str(path.relative_to(root))
-        folder = str(Path(rel).parent)
-        n_demo = sum(1 for r, _ in demo_inputs if str(Path(r).parent) == folder)
-        if n_demo > 1 and any(r == rel for r, _ in demo_inputs):
-            if folder not in shown:           # five seeds are one line, not five
-                shown.add(folder)
-                typer.echo(f"  {folder + '/':<24} {n_demo} demo files from examples/{ctype.folder} -- replace them")
-            continue
-        blurb = _BLURB.get(rel) or ("demo input from the example -- replace it"
-                                   if any(r == rel for r, _ in demo_inputs) else "")
-        typer.echo(f"  {rel:<24} {blurb}")
+        typer.echo(f"  {rel:<24} {_BLURB.get(rel, '')}")
+    if ctype.number == 3:
+        typer.echo(f"  {'inputs/seeds/':<24} empty -- put your POSCAR/CIF files here")
     typer.echo("\nEdit first:")
     for line in ctype.edit_first:
         typer.echo(f"  {line}")
@@ -307,6 +303,7 @@ _BLURB = {
     "machine.yaml": "partitions, walltime, modules, VASP, POTCARs",
     "recipe.yaml": "the DFT ladder: INCAR, k-points, resources",
     "inputs/README.md": "what goes in inputs/ for this type",
+    "inputs/compositions.csv": "empty -- your formulas, one per line",
     "README.md": "what to edit, what to run",
 }
 

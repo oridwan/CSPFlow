@@ -1,9 +1,11 @@
 # Example campaigns
 
 Three complete campaigns, one per **campaign type**. They are also the
-templates: `csp init <type> <name>` copies one of these folders and changes
-four lines of its `campaign.yaml` (`name`, `machine`, `dft.recipe`,
-`reference.mode`), so an example and the campaign it starts cannot drift apart.
+templates: `csp init <type> <name>` copies the settings of one of these
+`campaign.yaml` files, so an example and the campaign it starts cannot drift
+apart. It does **not** copy the example chemistry -- the element groups, the
+formulas, the CSV or the seed files. A new campaign starts empty and waits for
+yours (D153). Copy an example's `inputs/` yourself if you want to run it.
 
 | type | folder | source mode | the question it answers | input |
 |---|---|---|---|---|
@@ -20,7 +22,9 @@ csp doctor
 csp source --dry-run
 ```
 
-`csp init my-shortlist` without a type prints the table above and asks.
+`csp init my-shortlist` without a type prints the table above and asks. The
+new campaign's `csp source --dry-run` stops until you add your formulas, and says
+so; to try the example as it is, run `csp source --dry-run -c examples/2-composition-list/campaign.yaml`.
 
 ## What is in each folder
 
@@ -42,7 +46,7 @@ Every line that is not a comment is a **live setting**, written out even where
 it equals the default. The comment beside it says what else it can be:
 
 ```yaml
-magnetic_order: ferri        # ferri | ferro | none                 <- pick ONE
+magnetic_order: ferro        # ferro | ferri | none                 <- pick ONE
 pick: 1                      # one number, or several: [1, 2]
 elements: [Sm, Tb]           # several: [Sm, Nd, Pr, ...]           <- comma-separated list
 overrides: {}                # several: {Sm: Sm_3, Ti: Ti_pv}       <- several key: value pairs

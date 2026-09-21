@@ -125,11 +125,23 @@ dft:
     overrides: {}                # several: {Sm: Sm_3, Ti: Ti_pv} -- element -> POTCAR symbol
   rare_earth:
     f_treatment: frozen          # frozen | valence  (valence needs ldau)
-    magnetic_order: ferri        # ferri | ferro | none
+    magnetic_order: ferro        # ferro | ferri | none  -- ferro matches the shared store
     reconstruct_ms: true         # true | false  -- add the frozen 4f moment back when reporting
+  # The magnetic setup is part of the DFT policy the shared reference store was
+  # computed with. Change any line below and this campaign's energies no longer
+  # sit on the store's hull -- `csp doctor` warns ("reference recipe").
   magnetism:
-    mode: ferrimagnetic_retm     # ferrimagnetic_retm | ferromagnetic | table | pymatgen | none
+    mode: ferromagnetic          # ferromagnetic | ferrimagnetic_retm | table | pymatgen | none
     strict: true                 # true | false  -- fail rather than take a default MAGMOM
+    table:                       # several: element -> initial moment (muB), added to the mode's table
+      As: 0.6                    # the store's own additions: elements its table
+      Sb: 0.6                    # lacked, which strict: true would otherwise refuse
+      Bi: 0.6
+      Au: 0.6
+      Ru: 3.0
+      In: 0.6
+      Se: 0.6
+      Te: 0.6
   ldau:
     enabled: false               # true | false
     ldau_type: 2                 # 1 | 2 | 4
@@ -137,9 +149,9 @@ dft:
     j: {}                        # several: {Sm: 0.0, Nd: 0.0} -- element -> J in eV
   nbands: auto                   # auto, or an integer
   incar_overrides: {}            # several: {NCORE: 8, LREAL: Auto} -- on top of every recipe step
-  max_in_flight: 120             # jobs queued at once
-  max_concurrent_tasks: 32       # array tasks running at once
-  max_cores: 2048                # cores queued + running for this campaign; null = no cap
+  max_in_flight: 50              # jobs queued at once
+  max_concurrent_tasks: 50       # array tasks running at once
+  max_cores: 3200                # cores queued + running; 3200 = 50 jobs x 64 ranks. null = no cap
   select:
     rank_by: e_above_hull_mlip   # the order Phase B spends the budget in
-    max_total: 400               # LIFETIME ceiling; a shortlist should not need 1,500
+    max_total: 5000              # LIFETIME ceiling on DFT jobs

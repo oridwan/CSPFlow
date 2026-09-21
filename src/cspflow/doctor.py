@@ -558,11 +558,13 @@ def check_reference_recipe(cfg: ResolvedConfig) -> Check:
 
     from .cli import store_settings_path
 
-    # the store's own settings.yaml first: it is what computed the energies
-    candidates = []
-    env = os.environ.get("CSPFLOW_STORE")
-    if env:
-        candidates.append(Path(env) / "settings.yaml")
+    # the store's own settings.yaml first: it is what computed the energies.
+    # `store_root()` falls back to the shared default store, so a user who leaves
+    # CSPFLOW_STORE unset -- as the install guide says to -- is compared against
+    # the store they will actually read, not a stale copy (D154).
+    from .reference.refstore import store_root
+
+    candidates = [store_root() / "settings.yaml"]
     fallback = store_settings_path()
     if fallback is not None:
         candidates.append(fallback)

@@ -8,11 +8,13 @@ worked example in `examples/`:
     3  structure_list     examples/3-structure-list/
 
 Those example files ARE the templates. `csp init` reads the example's
-campaign.yaml and changes four lines -- `name`, `machine`, `dft.recipe` and
-`reference.mode` -- and nothing else, so an example and the campaign it scaffolds
-cannot drift apart. There used to be a separate all-modes template string here,
-and it had already diverged from the examples (dead `calibrate:` blocks in one,
-not the other).
+campaign.yaml, changes `name`, `machine`, `dft.recipe` and `reference.mode`, and
+BLANKS the example's chemistry -- type 1's element groups, type 2's inline
+formulas -- so a new campaign never runs on Sm-Fe by accident (D153). It also
+writes empty inputs rather than copying the demo CSV or seeds. Every setting and
+its alternatives are still the example's, so the two cannot drift apart.
+There used to be a separate all-modes template string here, and it had already
+diverged from the examples (dead `calibrate:` blocks in one, not the other).
 
 The machine profile and DFT recipe are NOT copied from the example folder; they
 are copied from the shipped files, so `-m local` still means the local profile.
@@ -20,7 +22,7 @@ The examples' own machine.yaml / recipe.yaml are pinned by a test to be exactly
 what `machine_copy` / `recipe_copy` produce.
 
 Inputs:  kind (1|2|3 or an alias), name, machine/recipe names, reference mode.
-Outputs: campaign.yaml text, README text, and the example's demo input files.
+Outputs: campaign.yaml text, README text, and the empty starter inputs.
 """
 
 from __future__ import annotations
@@ -55,7 +57,7 @@ CAMPAIGN_TYPES: dict[int, CampaignType] = {
         what_you_give="element groups; cspflow enumerates the formulas and generates structures",
         aliases=("chemical_space", "chemical-space", "space", "sweep"),
         edit_first=(
-            "campaign.yaml  source.chemical_space.groups   the elements, and how many to pick from each",
+            "campaign.yaml  source.chemical_space.groups   fill in `elements: []` for each group",
             "campaign.yaml  max_atoms_formula, defaults     the sweep's size -- check it with --dry-run",
         ),
     ),
@@ -65,8 +67,8 @@ CAMPAIGN_TYPES: dict[int, CampaignType] = {
         what_you_give="formulas, inline or in a CSV; cspflow generates structures for exactly those",
         aliases=("composition_list", "composition-list", "compositions", "formulas"),
         edit_first=(
-            "inputs/compositions.csv                        DEMO list -- replace it with your formulas",
-            "campaign.yaml  source.composition_list.items   the inline exceptions (or delete them)",
+            "inputs/compositions.csv                        your formulas, one per line (empty now)",
+            "campaign.yaml  source.composition_list.items   or list a few inline instead",
         ),
     ),
     3: CampaignType(
@@ -75,7 +77,7 @@ CAMPAIGN_TYPES: dict[int, CampaignType] = {
         what_you_give="POSCAR/CIF files; nothing is generated, they enter the funnel at screen",
         aliases=("structure_list", "structure-list", "structures", "seeds"),
         edit_first=(
-            "inputs/seeds/                                  DEMO seeds -- replace them with your files",
+            "inputs/seeds/                                  put your POSCAR/CIF files here (empty now)",
             "campaign.yaml  structure_list.max_atoms        must clear your largest seed",
         ),
     ),
@@ -190,8 +192,9 @@ def _strip_comments(text: str) -> str:
 
 def campaign_yaml(kind: CampaignType | int | str, *, name: str,
                   machine: str = "machine.yaml", recipe: str = "recipe.yaml",
-                  minimal: bool = False, reference_mode: str | None = None) -> str:
-    """The campaign file for `kind`: the example's, with four lines changed.
+                  minimal: bool = False, reference_mode: str | None = None,
+                  keep_example_chemistry: bool = False) -> str:
+    """The campaign file for `kind`: the example's settings, none of its chemistry.
 
     `reference_mode` is the answer to the one question `csp init` asks -- whether
     the MP reference phases get recomputed at this campaign's own DFT settings
@@ -209,6 +212,8 @@ def campaign_yaml(kind: CampaignType | int | str, *, name: str,
         if reference_mode not in ("recompute", "mp_energies"):
             raise ValueError("reference_mode must be 'recompute' or 'mp_energies'")
         text = _set_value(text, "  mode: ", reference_mode, current=r"recompute|mp_energies")
+    if not keep_example_chemistry:
+        text = _blank_chemistry(ctype, text)
 
     if minimal:
         header = (f"# {name} -- cspflow campaign, {ctype.label}. `csp init {ctype.number} {name}`\n"
@@ -218,13 +223,54 @@ def campaign_yaml(kind: CampaignType | int | str, *, name: str,
     return _banner(ctype, name) + "\n" + _drop_banner(text)
 
 
-def example_inputs(kind: CampaignType) -> list[tuple[str, Path]]:
-    """(path relative to the campaign, source file) for the example's demo inputs."""
-    root = example_dir(kind)
-    inputs = root / "inputs"
-    if not inputs.is_dir():
-        return []
-    return [(str(p.relative_to(root)), p) for p in sorted(inputs.rglob("*")) if p.is_file()]
+_ITEMS_PLACEHOLDER = """\
+      items: []                  # FILL IN here and/or in inputs/compositions.csv -- several:
+      #   - {formula: SmFe12, z: [1, 2]}
+      #   - {formula: Sm2Fe17, z: [1, 1], n_structures: {mode: fixed, count: 60}}
+"""
+
+
+def _blank_chemistry(kind: CampaignType, text: str) -> str:
+    """Remove the example's chemistry so nothing runs until the user supplies theirs.
+
+    Each placeholder fails loudly at `csp source`, naming what to fill in, while
+    the campaign still loads -- so `csp doctor` can check the cluster first.
+    Every edit must match, so an example reshaped out from under this fails here.
+    """
+    if kind.number == 1:
+        text, n = re.subn(r"^(          elements: )\[[^\]]*\]\s*#.*$",
+                          r"\1[]                 # FILL IN -- several: [Sm, Nd, Pr]",
+                          text, flags=re.M)
+        if n < 1:
+            raise ValueError("type 1 example has no `elements:` lines to blank")
+    elif kind.number == 2:
+        text, n = re.subn(r"(?ms)^      items:.*?(?=^      from_file:)", _ITEMS_PLACEHOLDER, text)
+        if n != 1:
+            raise ValueError("type 2 example: could not find the items block to blank")
+    elif kind.number == 3:
+        # No chemistry in the yaml; only a comment that names the demo seed.
+        old = "# a bigger seed is refused at read time; Sm2Fe17 is 57"
+        if old not in text:
+            raise ValueError("type 3 example: max_atoms comment changed; update _blank_chemistry")
+        text = text.replace(old, "# a bigger seed is refused at read time; raise for big cells")
+    return text
+
+
+COMPOSITIONS_CSV = """\
+# Your formulas, one per line:  formula[,z_min,z_max,n_structures]
+# Blank cells inherit from source.defaults in campaign.yaml. `#` comments must be
+# on a line of their own. Examples (remove the leading "# " to use one):
+# SmFe12,1,2,40
+# Sm2Fe17,1,1,
+formula,z_min,z_max,n_structures
+"""
+
+
+def starter_inputs(kind: CampaignType) -> dict[str, str]:
+    """Empty input files for a new campaign, keyed by path. No demo data."""
+    if kind.number == 2:
+        return {"inputs/compositions.csv": COMPOSITIONS_CSV}
+    return {}
 
 
 # --------------------------------------------------------------------------
@@ -277,8 +323,8 @@ csp config show --origins     # every resolved value, and which file set it
 
 _INPUTS_LINE = {
     1: "nothing -- a chemical_space campaign names its elements in campaign.yaml",
-    2: "`compositions.csv`: the formulas to generate (demo list; replace it)",
-    3: "`seeds/`: the structures to screen (demo Sm-Fe seeds; replace them)",
+    2: "`compositions.csv`: the formulas to generate (starts empty)",
+    3: "`seeds/`: the structures to screen (starts empty)",
 }
 
 _INPUTS_README = {
@@ -291,8 +337,8 @@ this folder. Adding a second source that does read files (a composition CSV or
 a folder of seeds) is how a sweep gets a hand-picked control group.
 """,
     2: """\
-`compositions.csv` is the example's DEMO list, copied by `csp init`.
-Replace it with your own formulas.
+`compositions.csv` starts empty: add your formulas, one per line. You can also
+list a few inline under `items:` in campaign.yaml -- the two are combined.
 
 Format:  formula[,z_min,z_max,n_structures]
 A header row is optional, blank cells inherit from `source.defaults`, and `#`
@@ -303,8 +349,8 @@ as part of the last cell.
 this folder.
 """,
     3: """\
-`seeds/` holds the example's five DEMO structures (DFT-relaxed Sm-Fe phases),
-copied by `csp init`. Replace them with your own files.
+Put your structure files in `seeds/` (it starts empty); subfolders are
+searched too. For a worked set, see examples/3-structure-list/inputs/seeds/.
 
 Read: .vasp .poscar .contcar .cif .xyz .extxyz .res .json, and any file named
 POSCAR or CONTCAR. Anything else in the folder is ignored, so a README beside
